@@ -1,9 +1,15 @@
 @echo off
+if /I not "%~1"=="__inner__" (
+    start "StockNetV2 cpu_only_dtw bench safe resume" cmd /k call "%~f0" __inner__
+    exit /b 0
+)
+shift /1
 setlocal
-set "MODE_NAME=cpu_only_dtw"
+rem Resume variant of the benchmark-aligned cpu_only_dtw launcher.
+set "MODE_NAME=cpu_only_dtw_bench_safe"
 set "PROFILE=cpu_only_dtw"
-set "RESUME_MODE=off"
-set "RUN_NAME=run_2026_01_01_2026_05_30_cpu18_cpu_only_dtw"
+set "RESUME_MODE=log"
+set "RUN_NAME=run_2026_01_01_2026_05_30_cpu18req_cpu_only_dtw_safe"
 set "MAX_WORKERS=18"
 set "MAX_IN_FLIGHT_TASKS=22"
 set "MAX_TASKS_PER_CHILD=4"
