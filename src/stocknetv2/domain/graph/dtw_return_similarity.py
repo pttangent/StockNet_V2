@@ -30,6 +30,8 @@ def build_dtw_return_similarity_edges(
     backend: str = "cpu_python",
     torch_device: str = "auto",
     torch_batch_pair_threshold: int = 1024,
+    torch_activation_pair_threshold: int | None = None,
+    torch_gpu_chunk_size: int = 8192,
 ) -> list[GraphEdge]:
     window_info = compute_effective_dtw_window(
         snapshot_time=snapshot_time,
@@ -85,12 +87,17 @@ def build_dtw_return_similarity_edges(
     if not pair_records:
         return []
 
+    activation_threshold = torch_activation_pair_threshold
+    if activation_threshold is None:
+        activation_threshold = torch_batch_pair_threshold
+
     scores, _effective_backend = compute_dtw_similarity_scores(
         [record[2] for record in pair_records],
         [record[3] for record in pair_records],
         backend=backend,
         torch_device=torch_device,
-        torch_batch_pair_threshold=torch_batch_pair_threshold,
+        torch_batch_pair_threshold=activation_threshold,
+        torch_gpu_chunk_size=torch_gpu_chunk_size,
     )
 
     edges: list[GraphEdge] = []

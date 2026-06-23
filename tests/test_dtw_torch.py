@@ -80,3 +80,43 @@ def test_batched_dtw_runs_on_cuda_when_available():
 
     assert similarity.device.type == "cuda"
     assert 0.0 < float(similarity[0].item()) <= 1.0
+
+
+def test_dtw_fp32_vs_cpu_python_precision():
+    import random
+    # Create random sequences
+    random.seed(42)
+    torch.manual_seed(42)
+    left_seqs = [[random.uniform(-1, 1) for _ in range(15)] for _ in range(5)]
+    right_seqs = [[random.uniform(-1, 1) for _ in range(15)] for _ in range(5)]
+
+    from stocknetv2.domain.graph.dtw_backend import compute_dtw_similarity_scores
+
+    scores_cpu, _ = compute_dtw_similarity_scores(left_seqs, right_seqs, backend="cpu_python")
+    scores_torch_fp32, _ = compute_dtw_similarity_scores(
+        left_seqs, right_seqs, backend="torch_cpu", torch_batch_pair_threshold=1, torch_dtype="float32"
+    )
+
+    for c, t in zip(scores_cpu, scores_torch_fp32, strict=True):
+        assert abs(c - t) < 1e-5
+
+
+def test_dtw_fp32_vs_fp64_precision():
+    import random
+    random.seed(42)
+    torch.manual_seed(42)
+    left_seqs = [[random.uniform(-1, 1) for _ in range(15)] for _ in range(5)]
+    right_seqs = [[random.uniform(-1, 1) for _ in range(15)] for _ in range(5)]
+
+    from stocknetv2.domain.graph.dtw_backend import compute_dtw_similarity_scores
+
+    scores_torch_fp32, _ = compute_dtw_similarity_scores(
+        left_seqs, right_seqs, backend="torch_cpu", torch_batch_pair_threshold=1, torch_dtype="float32"
+    )
+    scores_torch_fp64, _ = compute_dtw_similarity_scores(
+        left_seqs, right_seqs, backend="torch_cpu", torch_batch_pair_threshold=1, torch_dtype="float64"
+    )
+
+    for t32, t64 in zip(scores_torch_fp32, scores_torch_fp64, strict=True):
+        assert abs(t32 - t64) < 1e-6
+

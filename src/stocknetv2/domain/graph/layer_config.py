@@ -42,7 +42,9 @@ class DTWLayerConfig:
     max_lookback_minutes: int = 30
     backend: str = "cpu_python"
     torch_device: str = "auto"
-    torch_batch_pair_threshold: int = 1024
+    torch_batch_pair_threshold: int = 1024  # Deprecated: use torch_activation_pair_threshold instead
+    torch_activation_pair_threshold: int = 1024
+    torch_gpu_chunk_size: int = 8192
     filter: LayerFilterConfig = field(default_factory=LayerFilterConfig)
 
 
@@ -117,8 +119,13 @@ def build_theme_discovery_settings(
     graph_torch_device: str,
     dtw_backend: str,
     dtw_torch_device: str,
-    dtw_torch_batch_pair_threshold: int,
+    dtw_torch_batch_pair_threshold: int = 1024,
+    torch_activation_pair_threshold: int | None = None,
+    torch_gpu_chunk_size: int = 8192,
 ) -> ThemeDiscoverySettings:
+    if torch_activation_pair_threshold is None:
+        torch_activation_pair_threshold = dtw_torch_batch_pair_threshold
+
     base_settings = ThemeDiscoverySettings()
     return ThemeDiscoverySettings(
         return_corr=replace(
@@ -145,12 +152,16 @@ def build_theme_discovery_settings(
             base_settings.dtw_return,
             backend=dtw_backend,
             torch_device=dtw_torch_device,
-            torch_batch_pair_threshold=max(1, dtw_torch_batch_pair_threshold),
+            torch_batch_pair_threshold=max(1, torch_activation_pair_threshold),
+            torch_activation_pair_threshold=max(1, torch_activation_pair_threshold),
+            torch_gpu_chunk_size=max(1, torch_gpu_chunk_size),
         ),
         dtw_trade_flow=replace(
             base_settings.dtw_trade_flow,
             backend=dtw_backend,
             torch_device=dtw_torch_device,
-            torch_batch_pair_threshold=max(1, dtw_torch_batch_pair_threshold),
+            torch_batch_pair_threshold=max(1, torch_activation_pair_threshold),
+            torch_activation_pair_threshold=max(1, torch_activation_pair_threshold),
+            torch_gpu_chunk_size=max(1, torch_gpu_chunk_size),
         ),
     )

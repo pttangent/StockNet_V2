@@ -4,6 +4,8 @@ import argparse
 import json
 import sys
 import traceback
+import time
+import random
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from dataclasses import asdict
 from datetime import UTC, datetime
@@ -91,7 +93,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dtw-backend", dest="dtw_backend", choices=("cpu_python", "torch_cpu", "torch_cuda", "torch_auto"))
     parser.add_argument("--cpu-dtw-backend", dest="dtw_backend", choices=("cpu_python", "torch_cpu", "torch_cuda", "torch_auto"))
     parser.add_argument("--dtw-torch-device", default=None)
-    parser.add_argument("--dtw-pair-batch-size", type=int, default=1024)
+    parser.add_argument("--dtw-pair-batch-size", type=int, default=1024, help="Deprecated: use --torch-activation-pair-threshold instead")
+    parser.add_argument("--torch-activation-pair-threshold", type=int, default=None)
+    parser.add_argument("--torch-gpu-chunk-size", type=int, default=8192)
     parser.add_argument("--system-memory-reserve-gb", type=int, default=10)
     parser.add_argument("--threads-per-worker", type=int, default=1)
     parser.set_defaults(
@@ -119,6 +123,8 @@ def main() -> int:
         dtw_backend=args.dtw_backend or str(mode_defaults["dtw_backend"]),
         dtw_torch_device=args.dtw_torch_device or str(mode_defaults["dtw_torch_device"]),
         dtw_torch_batch_pair_threshold=max(1, args.dtw_pair_batch_size),
+        torch_activation_pair_threshold=args.torch_activation_pair_threshold,
+        torch_gpu_chunk_size=args.torch_gpu_chunk_size,
     )
     profile = resolve_layer_profile(args.profile, settings)
     schedule = _filter_snapshots(
@@ -181,6 +187,8 @@ def main() -> int:
         graph_torch_device=args.graph_torch_device or str(mode_defaults["graph_torch_device"]),
         dtw_torch_device=args.dtw_torch_device or str(mode_defaults["dtw_torch_device"]),
         dtw_pair_batch_size=args.dtw_pair_batch_size,
+        torch_activation_pair_threshold=args.torch_activation_pair_threshold,
+        torch_gpu_chunk_size=args.torch_gpu_chunk_size,
         max_workers=max(1, args.max_workers),
         max_tasks_per_child=max(1, args.max_tasks_per_child),
         max_in_flight_tasks=max(1, args.max_in_flight_tasks),
@@ -273,6 +281,8 @@ def _run_tasks(
     dtw_backend: str,
     dtw_torch_device: str,
     dtw_pair_batch_size: int,
+    torch_activation_pair_threshold: int | None = None,
+    torch_gpu_chunk_size: int = 8192,
     max_workers: int,
     max_tasks_per_child: int,
     max_in_flight_tasks: int,
@@ -296,6 +306,8 @@ def _run_tasks(
                         "dtw_backend": dtw_backend,
                         "dtw_torch_device": dtw_torch_device,
                         "dtw_pair_batch_size": dtw_pair_batch_size,
+                        "torch_activation_pair_threshold": torch_activation_pair_threshold,
+                        "torch_gpu_chunk_size": torch_gpu_chunk_size,
                         "progress_path": str(progress_path),
                         "trade_date": task.trade_date,
                         "window_start": task.window_start.isoformat(),
@@ -333,6 +345,8 @@ def _run_tasks(
                         "dtw_backend": dtw_backend,
                         "dtw_torch_device": dtw_torch_device,
                         "dtw_pair_batch_size": dtw_pair_batch_size,
+                        "torch_activation_pair_threshold": torch_activation_pair_threshold,
+                        "torch_gpu_chunk_size": torch_gpu_chunk_size,
                         "progress_path": str(progress_path),
                         "trade_date": task.trade_date,
                         "window_start": task.window_start.isoformat(),
@@ -364,6 +378,8 @@ def _run_block_worker(payload: dict[str, object]) -> list[dict[str, object]]:
         dtw_backend=str(payload["dtw_backend"]),
         dtw_torch_device=str(payload["dtw_torch_device"]),
         dtw_torch_batch_pair_threshold=max(1, int(payload["dtw_pair_batch_size"])),
+        torch_activation_pair_threshold=payload.get("torch_activation_pair_threshold"),
+        torch_gpu_chunk_size=payload.get("torch_gpu_chunk_size") or 8192,
     )
     profile = resolve_layer_profile(str(payload["profile_name"]), settings)
     snapshots = [
@@ -433,8 +449,15 @@ def _append_run_log(run_log_path: Path, rows: list[dict[str, object]]) -> None:
 
 def _append_progress_event(progress_path: Path, row: dict[str, object]) -> None:
     progress_path.parent.mkdir(parents=True, exist_ok=True)
-    with progress_path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+    for attempt in range(10):
+        try:
+            with progress_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+            return
+        except PermissionError:
+            if attempt == 9:
+                raise
+            time.sleep(0.05 + random.random() * 0.1)
 
 
 def _append_failure(failures_path: Path, block_id: str, exc: Exception) -> None:

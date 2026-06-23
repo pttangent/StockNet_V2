@@ -29,11 +29,25 @@ if not defined DATE_START set "DATE_START=2026-01-01"
 if not defined DATE_END set "DATE_END=2026-05-30"
 if not defined SNAPSHOT_START set "SNAPSHOT_START="
 if not defined SNAPSHOT_END set "SNAPSHOT_END="
-if not defined MAX_WORKERS set "MAX_WORKERS=18"
+if not defined MAX_WORKERS (
+    if "%DTW_BACKEND%"=="torch_cuda" (
+        set "MAX_WORKERS=2"
+    ) else (
+        set "MAX_WORKERS=20"
+    )
+)
 if not defined SNAPSHOT_BLOCK_SIZE set "SNAPSHOT_BLOCK_SIZE=8"
 if not defined MAX_TASKS_PER_CHILD set "MAX_TASKS_PER_CHILD=4"
-if not defined MAX_IN_FLIGHT_TASKS set "MAX_IN_FLIGHT_TASKS=22"
+if not defined MAX_IN_FLIGHT_TASKS (
+    if "%DTW_BACKEND%"=="torch_cuda" (
+        set "MAX_IN_FLIGHT_TASKS=4"
+    ) else (
+        set "MAX_IN_FLIGHT_TASKS=24"
+    )
+)
 if not defined DTW_PAIR_BATCH_SIZE set "DTW_PAIR_BATCH_SIZE=1024"
+if not defined TORCH_ACTIVATION_PAIR_THRESHOLD set "TORCH_ACTIVATION_PAIR_THRESHOLD=1024"
+if not defined TORCH_GPU_CHUNK_SIZE set "TORCH_GPU_CHUNK_SIZE=8192"
 if not defined WRAPPER_NAME set "WRAPPER_NAME=%~nx0"
 if not defined ORIGINAL_BAT_PATH set "ORIGINAL_BAT_PATH=%~f0"
 
@@ -103,6 +117,8 @@ echo Layer workers  : 1
 echo Resume mode    : %RESUME_MODE%
 if defined DTW_BACKEND echo DTW backend    : %DTW_BACKEND%
 if defined DTW_TORCH_DEVICE echo DTW device     : %DTW_TORCH_DEVICE%
+if defined TORCH_ACTIVATION_PAIR_THRESHOLD echo DTW threshold  : %TORCH_ACTIVATION_PAIR_THRESHOLD%
+if defined TORCH_GPU_CHUNK_SIZE echo DTW chunk size : %TORCH_GPU_CHUNK_SIZE%
 echo Output root    : %OUTPUT_ROOT%
 echo ============================================================
 echo.
@@ -117,7 +133,7 @@ if defined MONITOR_PID (
 )
 
 set "STATUS_LINE=Launching python worker..."
-for /f %%I in ('powershell -NoProfile -Command "$argsList=@('%RUN_SCRIPT%','--pack-root','%PACK_ROOT%','--output-root','%OUTPUT_ROOT%','--run-name','%RUN_NAME%','--profile','%PROFILE%','--date-start','%DATE_START%','--date-end','%DATE_END%','--max-workers','%MAX_WORKERS%','--snapshot-block-size','%SNAPSHOT_BLOCK_SIZE%','--max-tasks-per-child','%MAX_TASKS_PER_CHILD%','--max-in-flight-tasks','%MAX_IN_FLIGHT_TASKS%','--resume-mode','%RESUME_MODE%','--dtw-pair-batch-size','%DTW_PAIR_BATCH_SIZE%'); if('%SNAPSHOT_START%' -ne ''){ $argsList += @('--snapshot-start','%SNAPSHOT_START%') }; if('%SNAPSHOT_END%' -ne ''){ $argsList += @('--snapshot-end','%SNAPSHOT_END%') }; if('%DTW_BACKEND%' -ne ''){ $argsList += @('--dtw-backend','%DTW_BACKEND%') }; if('%DTW_TORCH_DEVICE%' -ne ''){ $argsList += @('--dtw-torch-device','%DTW_TORCH_DEVICE%') }; if('%GRAPH_BACKEND%' -ne ''){ $argsList += @('--graph-backend','%GRAPH_BACKEND%') }; if('%GRAPH_TORCH_DEVICE%' -ne ''){ $argsList += @('--graph-torch-device','%GRAPH_TORCH_DEVICE%') }; $p=Start-Process python -ArgumentList $argsList -RedirectStandardOutput '%RUN_STDOUT%' -RedirectStandardError '%RUN_STDERR%' -PassThru -WindowStyle Hidden; $p.Id"') do set "RUN_PID=%%I"
+for /f %%I in ('powershell -NoProfile -Command "$argsList=@('%RUN_SCRIPT%','--pack-root','%PACK_ROOT%','--output-root','%OUTPUT_ROOT%','--run-name','%RUN_NAME%','--profile','%PROFILE%','--date-start','%DATE_START%','--date-end','%DATE_END%','--max-workers','%MAX_WORKERS%','--snapshot-block-size','%SNAPSHOT_BLOCK_SIZE%','--max-tasks-per-child','%MAX_TASKS_PER_CHILD%','--max-in-flight-tasks','%MAX_IN_FLIGHT_TASKS%','--resume-mode','%RESUME_MODE%','--dtw-pair-batch-size','%DTW_PAIR_BATCH_SIZE%','--torch-activation-pair-threshold','%TORCH_ACTIVATION_PAIR_THRESHOLD%','--torch-gpu-chunk-size','%TORCH_GPU_CHUNK_SIZE%'); if('%SNAPSHOT_START%' -ne ''){ $argsList += @('--snapshot-start','%SNAPSHOT_START%') }; if('%SNAPSHOT_END%' -ne ''){ $argsList += @('--snapshot-end','%SNAPSHOT_END%') }; if('%DTW_BACKEND%' -ne ''){ $argsList += @('--dtw-backend','%DTW_BACKEND%') }; if('%DTW_TORCH_DEVICE%' -ne ''){ $argsList += @('--dtw-torch-device','%DTW_TORCH_DEVICE%') }; if('%GRAPH_BACKEND%' -ne ''){ $argsList += @('--graph-backend','%GRAPH_BACKEND%') }; if('%GRAPH_TORCH_DEVICE%' -ne ''){ $argsList += @('--graph-torch-device','%GRAPH_TORCH_DEVICE%') }; $p=Start-Process python -ArgumentList $argsList -RedirectStandardOutput '%RUN_STDOUT%' -RedirectStandardError '%RUN_STDERR%' -PassThru -WindowStyle Hidden; $p.Id"') do set "RUN_PID=%%I"
 if not defined RUN_PID (
     echo [ERROR] Failed to start python process.
     if exist "%RUN_STDERR%" powershell -NoProfile -Command "Get-Content '%RUN_STDERR%' -Tail 20"

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from collections import defaultdict
 import numpy as np
 import pandas as pd
 
 from stocknetv2.domain.graph.dtw_backend import compute_dtw_similarity_scores
+from stocknetv2.domain.graph.dtw_pair_batch import PairComponentRecord
 from stocknetv2.domain.graph.dtw_window import compute_effective_dtw_window
 from stocknetv2.domain.graph.edge import GraphEdge
 from stocknetv2.domain.graph.edge_filter import keep_top_k_per_symbol
@@ -32,6 +34,8 @@ def build_dtw_trade_flow_similarity_edges(
     backend: str = "cpu_python",
     torch_device: str = "auto",
     torch_batch_pair_threshold: int = 1024,
+    torch_activation_pair_threshold: int | None = None,
+    torch_gpu_chunk_size: int = 8192,
 ) -> list[GraphEdge]:
     window_info = compute_effective_dtw_window(
         snapshot_time=snapshot_time,
@@ -75,54 +79,74 @@ def build_dtw_trade_flow_similarity_edges(
         + 0.20 * _coarse_similarity_matrix(large_trade_matrix, symbols, effective_min_overlap_points, min_variance)
     )
 
-    pair_component_records: list[dict[str, object]] = []
-    for left_index, right_index in select_topk_pair_indices(
+    pair_indices = list(select_topk_pair_indices(
         coarse_matrix,
         min_score=-1.0,
         top_k_per_symbol=max(top_k_per_symbol * 4, top_k_per_symbol),
         reciprocal_top_k=None,
         degree_cap=None,
-    ):
-        left_symbol = symbols[left_index]
-        right_symbol = symbols[right_index]
-        score, support_points, component_count = _combined_flow_similarity(
-            left_symbol=left_symbol,
-            right_symbol=right_symbol,
-            flow_matrix=flow_matrix,
-            imbalance_matrix=imbalance_matrix,
-            large_trade_matrix=large_trade_matrix,
-            min_overlap_points=effective_min_overlap_points,
-            min_variance=min_variance,
-            backend=backend,
-            torch_device=torch_device,
-            torch_batch_pair_threshold=torch_batch_pair_threshold,
-        )
-        if component_count < 2 or support_points < effective_min_overlap_points or score < min_similarity:
-            continue
-        pair_component_records.append(
-            {
-                "source_symbol": left_symbol,
-                "target_symbol": right_symbol,
-                "score": score,
-                "support_points": support_points,
-            }
-        )
+    ))
+
+    records = _collect_trade_flow_pair_components(
+        symbols=symbols,
+        pair_indices=pair_indices,
+        flow_matrix=flow_matrix,
+        imbalance_matrix=imbalance_matrix,
+        large_trade_matrix=large_trade_matrix,
+        min_overlap_points=effective_min_overlap_points,
+        min_variance=min_variance,
+    )
+
+    if not records:
+        return []
+
+    activation_threshold = torch_activation_pair_threshold
+    if activation_threshold is None:
+        activation_threshold = torch_batch_pair_threshold
+
+    scores, effective_backend = compute_dtw_similarity_scores(
+        [r.left for r in records],
+        [r.right for r in records],
+        backend=backend,
+        torch_device=torch_device,
+        torch_batch_pair_threshold=activation_threshold,
+        torch_gpu_chunk_size=torch_gpu_chunk_size,
+    )
+
+    pair_weights = defaultdict(float)
+    pair_weighted_scores = defaultdict(float)
+    pair_min_support = {}
+
+    for r, score in zip(records, scores, strict=True):
+        pair_key = r.pair_key
+        pair_weights[pair_key] += r.component_weight
+        pair_weighted_scores[pair_key] += r.component_weight * score
+        if pair_key not in pair_min_support:
+            pair_min_support[pair_key] = r.support_points
+        else:
+            pair_min_support[pair_key] = min(pair_min_support[pair_key], r.support_points)
 
     edges: list[GraphEdge] = []
-    for record in pair_component_records:
+    for pair_key, total_weight in pair_weights.items():
+        if total_weight <= 0:
+            continue
+        final_score = pair_weighted_scores[pair_key] / total_weight
+        if final_score < min_similarity:
+            continue
+        left_symbol, right_symbol = pair_key
         edges.append(
             GraphEdge(
                 graph_layer="dtw_trade_flow_similarity_graph",
                 edge_type="dtw_trade_flow_similarity",
-                source_symbol=str(record["source_symbol"]),
-                target_symbol=str(record["target_symbol"]),
+                source_symbol=left_symbol,
+                target_symbol=right_symbol,
                 snapshot_time=snapshot_time,
-                weight=float(record["score"]),
-                raw_score=float(record["score"]),
-                support_points=int(record["support_points"]),
+                weight=final_score,
+                raw_score=final_score,
+                support_points=pair_min_support[pair_key],
                 edge_confidence=float(window_info["window_confidence"]),
                 effective_lookback_minutes=minutes,
-                calculation_backend=_backend_label(backend, torch_device),
+                calculation_backend=str(effective_backend),
             )
         )
     return keep_top_k_per_symbol(
@@ -133,57 +157,55 @@ def build_dtw_trade_flow_similarity_edges(
     )
 
 
-def _combined_flow_similarity(
-    *,
-    left_symbol: str,
-    right_symbol: str,
+def _collect_trade_flow_pair_components(
+    symbols: list[str],
+    pair_indices: list[tuple[int, int]],
     flow_matrix: pd.DataFrame,
     imbalance_matrix: pd.DataFrame,
     large_trade_matrix: pd.DataFrame,
     min_overlap_points: int,
     min_variance: float,
-    backend: str,
-    torch_device: str,
-    torch_batch_pair_threshold: int,
-) -> tuple[float, int, int]:
-    component_candidates: list[tuple[float, list[float], list[float], int]] = []
-    for component_weight, matrix in (
-        (0.50, flow_matrix),
-        (0.30, imbalance_matrix),
-        (0.20, large_trade_matrix),
-    ):
-        result = _matrix_series_similarity(
-            matrix,
-            left_symbol,
-            right_symbol,
-            min_overlap_points=min_overlap_points,
-            min_variance=min_variance,
-        )
-        if result is None:
-            continue
-        left_values, right_values, support_points = result
-        component_candidates.append((component_weight, left_values, right_values, support_points))
+) -> list[PairComponentRecord]:
+    records = []
+    for left_index, right_index in pair_indices:
+        left_symbol = symbols[left_index]
+        right_symbol = symbols[right_index]
 
-    if not component_candidates:
-        return 0.0, 0, 0
-    component_scores, _ = compute_dtw_similarity_scores(
-        [candidate[1] for candidate in component_candidates],
-        [candidate[2] for candidate in component_candidates],
-        backend=backend,
-        torch_device=torch_device,
-        torch_batch_pair_threshold=torch_batch_pair_threshold,
-    )
-    total_weight = sum(weight for weight, _, _, _ in component_candidates)
-    score = sum(
-        weight * component_score
-        for (weight, _left_values, _right_values, _support_points), component_score in zip(
-            component_candidates,
-            component_scores,
-            strict=True,
-        )
-    ) / total_weight
-    support_points = min(support for _weight, _left_values, _right_values, support in component_candidates)
-    return float(score), int(support_points), len(component_candidates)
+        pair_candidates = []
+        for component_weight, matrix in (
+            (0.50, flow_matrix),
+            (0.30, imbalance_matrix),
+            (0.20, large_trade_matrix),
+        ):
+            result = _matrix_series_similarity(
+                matrix,
+                left_symbol,
+                right_symbol,
+                min_overlap_points=min_overlap_points,
+                min_variance=min_variance,
+            )
+            if result is None:
+                continue
+            left_values, right_values, support_points = result
+            pair_candidates.append((component_weight, left_values, right_values, support_points))
+
+        if len(pair_candidates) < 2:
+            continue
+        min_support = min(item[3] for item in pair_candidates)
+        if min_support < min_overlap_points:
+            continue
+
+        for weight, left, right, support in pair_candidates:
+            records.append(
+                PairComponentRecord(
+                    pair_key=(left_symbol, right_symbol),
+                    component_weight=weight,
+                    left=left,
+                    right=right,
+                    support_points=support,
+                )
+            )
+    return records
 
 
 def _matrix_series_similarity(
