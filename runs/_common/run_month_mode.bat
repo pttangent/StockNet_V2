@@ -45,6 +45,11 @@ set "RUN_STDERR=%OUTPUT_ROOT%\launcher.stderr.log"
 set "RUN_LOG=%OUTPUT_ROOT%\run.log"
 set "RUN_PROGRESS=%OUTPUT_ROOT%\progress.jsonl"
 set "RUN_PID_FILE=%OUTPUT_ROOT%\run.pid"
+set "MONITOR_PORT=3030"
+set "MONITOR_STDOUT=%OUTPUT_ROOT%\monitor.stdout.log"
+set "MONITOR_STDERR=%OUTPUT_ROOT%\monitor.stderr.log"
+set "MONITOR_PID_FILE=%OUTPUT_ROOT%\monitor.pid"
+set "MONITOR_PORT_FILE=%OUTPUT_ROOT%\monitor.port"
 
 if /I "%~1"=="stop" goto STOP_RUN
 
@@ -102,6 +107,15 @@ echo Output root    : %OUTPUT_ROOT%
 echo ============================================================
 echo.
 
+for /f %%I in ('powershell -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { $_.Name -eq ''node.exe'' -and $_.CommandLine -like ''*server.js*'' } | ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch {} }; 'ok'"') do set "NODE_CLEANUP=%%I"
+for /f %%P in ('powershell -NoProfile -Command "$ports=3030..3055; foreach($port in $ports){ try { $listener=[System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback,$port); $listener.Start(); $listener.Stop(); $port; break } catch { if($listener){ try { $listener.Stop() } catch {} } } }"') do set "MONITOR_PORT=%%P"
+> "%MONITOR_PORT_FILE%" echo %MONITOR_PORT%
+for /f %%I in ('powershell -NoProfile -Command "$env:PORT='%MONITOR_PORT%'; $env:STOCKNETV2_MONTH_RUN_ROOT='%OUTPUT_ROOT%'; $p=Start-Process node -ArgumentList @('%ROOT%\server.js') -RedirectStandardOutput '%MONITOR_STDOUT%' -RedirectStandardError '%MONITOR_STDERR%' -PassThru -WindowStyle Hidden; $p.Id"') do set "MONITOR_PID=%%I"
+if defined MONITOR_PID (
+    > "%MONITOR_PID_FILE%" echo %MONITOR_PID%
+    start "" "http://127.0.0.1:%MONITOR_PORT%/month-progress"
+)
+
 set "STATUS_LINE=Launching python worker..."
 for /f %%I in ('powershell -NoProfile -Command "$argsList=@('%RUN_SCRIPT%','--pack-root','%PACK_ROOT%','--output-root','%OUTPUT_ROOT%','--run-name','%RUN_NAME%','--profile','%PROFILE%','--date-start','%DATE_START%','--date-end','%DATE_END%','--max-workers','%MAX_WORKERS%','--snapshot-block-size','%SNAPSHOT_BLOCK_SIZE%','--max-tasks-per-child','%MAX_TASKS_PER_CHILD%','--max-in-flight-tasks','%MAX_IN_FLIGHT_TASKS%','--resume-mode','%RESUME_MODE%','--dtw-pair-batch-size','%DTW_PAIR_BATCH_SIZE%'); if('%SNAPSHOT_START%' -ne ''){ $argsList += @('--snapshot-start','%SNAPSHOT_START%') }; if('%SNAPSHOT_END%' -ne ''){ $argsList += @('--snapshot-end','%SNAPSHOT_END%') }; if('%DTW_BACKEND%' -ne ''){ $argsList += @('--dtw-backend','%DTW_BACKEND%') }; if('%DTW_TORCH_DEVICE%' -ne ''){ $argsList += @('--dtw-torch-device','%DTW_TORCH_DEVICE%') }; if('%GRAPH_BACKEND%' -ne ''){ $argsList += @('--graph-backend','%GRAPH_BACKEND%') }; if('%GRAPH_TORCH_DEVICE%' -ne ''){ $argsList += @('--graph-torch-device','%GRAPH_TORCH_DEVICE%') }; $p=Start-Process python -ArgumentList $argsList -RedirectStandardOutput '%RUN_STDOUT%' -RedirectStandardError '%RUN_STDERR%' -PassThru -WindowStyle Hidden; $p.Id"') do set "RUN_PID=%%I"
 if not defined RUN_PID (
@@ -113,8 +127,9 @@ if not defined RUN_PID (
 > "%RUN_PID_FILE%" echo %RUN_PID%
 
 echo [INFO] Python PID: %RUN_PID%
+if defined MONITOR_PID echo [INFO] Frontend URL : http://127.0.0.1:%MONITOR_PORT%/month-progress
 echo [INFO] Stop command: "%WRAPPER_NAME%" stop
-echo [INFO] Monitoring progress.jsonl for progress...
+echo [INFO] Frontend progress monitor started.
 
 :MONITOR
 tasklist /FI "PID eq %RUN_PID%" 2>nul | find "%RUN_PID%" >nul
@@ -153,6 +168,7 @@ if exist "%RUN_STDERR%" (
 )
 echo [INFO] stdout: %RUN_STDOUT%
 echo [INFO] stderr: %RUN_STDERR%
+if defined MONITOR_PID echo [INFO] frontend: http://127.0.0.1:%MONITOR_PORT%/month-progress
 pause
 
 endlocal
@@ -162,12 +178,18 @@ exit /b 0
 echo [INFO] Stopping run processes for %RUN_NAME%...
 powershell -NoProfile -Command ^
   "$pidFile='%RUN_PID_FILE%';" ^
+  "$monitorPidFile='%MONITOR_PID_FILE%';" ^
+  "$monitorPortFile='%MONITOR_PORT_FILE%';" ^
   "$runName='%RUN_NAME%';" ^
   "$mainPid=$null;" ^
+  "$monitorPid=$null;" ^
   "if(Test-Path $pidFile){ try { $mainPid=[int](Get-Content $pidFile | Select-Object -First 1) } catch {} };" ^
+  "if(Test-Path $monitorPidFile){ try { $monitorPid=[int](Get-Content $monitorPidFile | Select-Object -First 1) } catch {} };" ^
   "if($mainPid){ Get-CimInstance Win32_Process | Where-Object { $_.ParentProcessId -eq $mainPid } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }; Stop-Process -Id $mainPid -Force -ErrorAction SilentlyContinue };" ^
+  "if($monitorPid){ Stop-Process -Id $monitorPid -Force -ErrorAction SilentlyContinue };" ^
   "Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'python.exe' -and $_.CommandLine -like ('*' + $runName + '*') -and $_.CommandLine -like '*run_month_graph_compute.py*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue };" ^
-  "if(Test-Path $pidFile){ Remove-Item $pidFile -Force -ErrorAction SilentlyContinue }"
+  "Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'node.exe' -and $_.CommandLine -like '*server.js*' -and $_.CommandLine -like ('*' + $runName + '*') } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue };" ^
+  "if(Test-Path $pidFile){ Remove-Item $pidFile -Force -ErrorAction SilentlyContinue }; if(Test-Path $monitorPidFile){ Remove-Item $monitorPidFile -Force -ErrorAction SilentlyContinue }; if(Test-Path $monitorPortFile){ Remove-Item $monitorPortFile -Force -ErrorAction SilentlyContinue }"
 echo [INFO] Stop signal completed.
 pause
 endlocal

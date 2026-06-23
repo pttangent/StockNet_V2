@@ -58,6 +58,18 @@ function getLogFilePath() {
   return process.env.STOCKNETV2_LOG_FILE || "";
 }
 
+function getMonthRunRoot() {
+  return process.env.STOCKNETV2_MONTH_RUN_ROOT || "";
+}
+
+function getBenchmarkStatusFilePath() {
+  return process.env.STOCKNETV2_BENCHMARK_STATUS_FILE || "";
+}
+
+function getBenchmarkLogFilePath() {
+  return process.env.STOCKNETV2_BENCHMARK_LOG_FILE || "";
+}
+
 function getDefaultProgressPayload() {
   return {
     status: "idle",
@@ -294,6 +306,463 @@ function resolveExistingWatchPath(targetPath) {
   return currentPath && fs.existsSync(currentPath) ? currentPath : null;
 }
 
+function readJsonFileSafe(filePath, fallback = null) {
+  if (!filePath || !fs.existsSync(filePath)) {
+    return fallback;
+  }
+  try {
+    return JSON.parse(fs.readFileSync(filePath, "utf8"));
+  } catch {
+    return fallback;
+  }
+}
+
+function readJsonlTail(filePath, maxLines = 1) {
+  if (!filePath || !fs.existsSync(filePath)) {
+    return [];
+  }
+  try {
+    const lines = fs.readFileSync(filePath, "utf8").split(/\r?\n/).filter(Boolean);
+    return lines.slice(-maxLines).map((line) => {
+      try {
+        return JSON.parse(line);
+      } catch {
+        return null;
+      }
+    }).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function countJsonlRows(filePath) {
+  if (!filePath || !fs.existsSync(filePath)) {
+    return 0;
+  }
+  try {
+    return fs.readFileSync(filePath, "utf8").split(/\r?\n/).filter(Boolean).length;
+  } catch {
+    return 0;
+  }
+}
+
+function groupLatestEventByTradeDate(rows) {
+  const eventMap = new Map();
+  for (const row of rows) {
+    if (!row?.trade_date) {
+      continue;
+    }
+    eventMap.set(String(row.trade_date), row);
+  }
+  return eventMap;
+}
+
+function countCompletedSnapshotsForDate(dateRoot) {
+  if (!dateRoot || !fs.existsSync(dateRoot)) {
+    return 0;
+  }
+  let total = 0;
+  const stack = [dateRoot];
+  while (stack.length > 0) {
+    const current = stack.pop();
+    const entries = fs.readdirSync(current, { withFileTypes: true });
+    for (const entry of entries) {
+      const fullPath = path.join(current, entry.name);
+      if (entry.isDirectory()) {
+        stack.push(fullPath);
+      } else if (entry.isFile() && entry.name === "_PROFILE_SUCCESS") {
+        total += 1;
+      }
+    }
+  }
+  return total;
+}
+
+function buildTradeDateRows(runRoot, runConfig, statusRows) {
+  const tradeDates = Array.isArray(runConfig?.trade_dates) ? runConfig.trade_dates : [];
+  const latestByTradeDate = groupLatestEventByTradeDate(statusRows);
+  return tradeDates.map((item) => {
+    const tradeDate = String(item.trade_date);
+    const month = String(item.month || tradeDate.slice(0, 7));
+    const plannedSnapshots = Number(item.planned_snapshots || 0);
+    const dateRoot = path.join(runRoot, `month=${month}`, "dates", `date=${tradeDate}`);
+    const started = fs.existsSync(dateRoot);
+    const completedSnapshots = countCompletedSnapshotsForDate(dateRoot);
+    const latestEvent = latestByTradeDate.get(tradeDate) || null;
+    let status = "pending";
+    if (completedSnapshots >= plannedSnapshots && plannedSnapshots > 0) {
+      status = "completed";
+    } else if (started) {
+      status = "running";
+    }
+    const progressPercent = plannedSnapshots > 0 ? Math.min(100, (completedSnapshots / plannedSnapshots) * 100) : 0;
+    return {
+      trade_date: tradeDate,
+      month,
+      planned_snapshots: plannedSnapshots,
+      completed_snapshots: completedSnapshots,
+      remaining_snapshots: Math.max(0, plannedSnapshots - completedSnapshots),
+      status,
+      progress_percent: Number(progressPercent.toFixed(2)),
+      latest_snapshot_clock: latestEvent?.snapshot_clock || null,
+      latest_status: latestEvent?.status || null,
+      updated_at: latestEvent?.updated_at || null,
+      started,
+      date_root: dateRoot,
+    };
+  });
+}
+
+function buildMonthRunProgressSnapshot() {
+  const runRoot = getMonthRunRoot();
+  if (!runRoot) {
+    return {
+      status: "idle",
+      mode: "month_run",
+      message: "STOCKNETV2_MONTH_RUN_ROOT is not configured.",
+    };
+  }
+  const runConfig = readJsonFileSafe(path.join(runRoot, "run_config.json"), {});
+  const statusRows = readJsonlTail(path.join(runRoot, "progress.jsonl"), 200);
+  const latest = statusRows.at(-1) || null;
+  const latestComplete = readJsonlTail(path.join(runRoot, "run.log"), 1).at(0) || null;
+  const failureCount = countJsonlRows(path.join(runRoot, "failures.jsonl"));
+  const completedSnapshots = countJsonlRows(path.join(runRoot, "run.log"));
+  const plannedSnapshots = Number(runConfig?.planned_snapshots || 0);
+  const pendingSnapshots = Number(runConfig?.pending_snapshots || 0);
+  const percent = plannedSnapshots > 0 ? Math.min(100, (completedSnapshots / plannedSnapshots) * 100) : 0;
+  const tradeDateRows = buildTradeDateRows(runRoot, runConfig, statusRows);
+  const processingTradeDates = tradeDateRows.filter((row) => row.status === "running");
+  const pendingTradeDates = tradeDateRows.filter((row) => row.status === "pending");
+  const completedTradeDates = tradeDateRows.filter((row) => row.status === "completed");
+
+  return {
+    mode: "month_run",
+    status: latest?.status || (completedSnapshots > 0 ? "running" : "starting"),
+    run_name: runConfig?.run_name || path.basename(runRoot),
+    profile: runConfig?.profile || null,
+    resume_mode: runConfig?.resume_mode || null,
+    date_start: runConfig?.date_start || null,
+    date_end: runConfig?.date_end || null,
+    planned_snapshots: plannedSnapshots,
+    pending_snapshots: pendingSnapshots,
+    completed_snapshots: completedSnapshots,
+    failure_count: failureCount,
+    progress_percent: Number(percent.toFixed(2)),
+    trade_dates: tradeDateRows,
+    trade_date_groups: {
+      running: processingTradeDates,
+      pending: pendingTradeDates,
+      completed: completedTradeDates,
+    },
+    current_trade_date: latest?.trade_date || latestComplete?.trade_date || null,
+    current_snapshot_id: latest?.snapshot_id || latestComplete?.snapshot_id || null,
+    current_snapshot_clock: latest?.snapshot_clock || latestComplete?.snapshot_clock || null,
+    current_worker_pid: latest?.worker_pid || latestComplete?.worker_pid || null,
+    current_edge_count: latestComplete?.edge_count ?? null,
+    updated_at: latest?.updated_at || latestComplete?.updated_at || null,
+    recent_events: statusRows.slice(-20),
+  };
+}
+
+function buildBenchmarkProgressSnapshot() {
+  const statusPath = getBenchmarkStatusFilePath();
+  const logPath = getBenchmarkLogFilePath();
+  return {
+    benchmark: readJsonFileSafe(statusPath, { status: "idle" }),
+    logs: logPath && fs.existsSync(logPath)
+      ? fs.readFileSync(logPath, "utf8").split(/\r?\n/).filter(Boolean).slice(-100)
+      : [],
+  };
+}
+
+function getMonthProgressPageHtml() {
+  return `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>StockNetV2 Month Run Progress</title>
+    <style>
+      :root {
+        --bg: #f5f7f4;
+        --panel: #ffffff;
+        --ink: #1f2937;
+        --muted: #6b7280;
+        --accent: #0f766e;
+        --line: #d1d5db;
+      }
+      body {
+        margin: 0;
+        font-family: "Segoe UI", "PingFang TC", sans-serif;
+        background: linear-gradient(180deg, #f7faf8 0%, #eef6f3 100%);
+        color: var(--ink);
+      }
+      .wrap {
+        max-width: 980px;
+        margin: 0 auto;
+        padding: 24px;
+      }
+      .hero, .panel {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 18px;
+        box-shadow: 0 10px 24px rgba(15, 23, 42, 0.06);
+      }
+      .hero {
+        padding: 24px;
+        margin-bottom: 18px;
+      }
+      .title {
+        font-size: 28px;
+        font-weight: 700;
+        margin: 0 0 8px 0;
+      }
+      .subtitle {
+        margin: 0;
+        color: var(--muted);
+      }
+      .track {
+        margin-top: 18px;
+        height: 18px;
+        background: #e5e7eb;
+        border-radius: 999px;
+        overflow: hidden;
+      }
+      .fill {
+        height: 100%;
+        width: 0%;
+        background: linear-gradient(90deg, var(--accent) 0%, #14b8a6 100%);
+        transition: width 0.35s ease;
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+        gap: 12px;
+        margin-top: 18px;
+      }
+      .card, .panel {
+        padding: 14px 16px;
+      }
+      .label {
+        color: var(--muted);
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+      }
+      .value {
+        font-size: 22px;
+        font-weight: 700;
+        margin-top: 6px;
+      }
+      .panel {
+        margin-top: 18px;
+      }
+      .panel h2 {
+        margin: 0 0 12px 0;
+        font-size: 18px;
+      }
+      .tabs {
+        display: flex;
+        gap: 10px;
+        margin-bottom: 14px;
+        flex-wrap: wrap;
+      }
+      .tab {
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        background: #f8fafc;
+        padding: 8px 14px;
+        cursor: pointer;
+        font-weight: 600;
+      }
+      .tab.active {
+        background: var(--accent);
+        color: white;
+        border-color: var(--accent);
+      }
+      .date-card {
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        padding: 12px 14px;
+        background: #fcfcfb;
+        margin-top: 10px;
+      }
+      .date-head {
+        display: flex;
+        justify-content: space-between;
+        gap: 12px;
+        align-items: baseline;
+      }
+      .date-name {
+        font-size: 18px;
+        font-weight: 700;
+      }
+      .date-status {
+        color: var(--muted);
+        font-size: 13px;
+      }
+      .mini-track {
+        margin-top: 10px;
+        height: 10px;
+        background: #e5e7eb;
+        border-radius: 999px;
+        overflow: hidden;
+      }
+      .mini-fill {
+        height: 100%;
+        background: linear-gradient(90deg, var(--accent) 0%, #14b8a6 100%);
+      }
+      .event {
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        padding: 10px 12px;
+        margin-top: 10px;
+        background: #fcfcfb;
+      }
+      .meta {
+        color: var(--muted);
+        font-size: 13px;
+        margin-top: 4px;
+      }
+      .mono {
+        font-family: "Cascadia Code", Consolas, monospace;
+        font-size: 12px;
+        white-space: pre-wrap;
+        background: #0f172a;
+        color: #d1fae5;
+        border-radius: 14px;
+        padding: 14px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <section class="hero">
+        <h1 class="title">StockNetV2 Month Run Progress</h1>
+        <p class="subtitle">Lightweight live monitor for month-range snapshot runs.</p>
+        <div class="track"><div id="fill" class="fill"></div></div>
+        <div class="grid">
+          <div class="card"><div class="label">Run</div><div id="runName" class="value">-</div></div>
+          <div class="card"><div class="label">Profile</div><div id="profile" class="value">-</div></div>
+          <div class="card"><div class="label">Status</div><div id="status" class="value">-</div></div>
+          <div class="card"><div class="label">Completed</div><div id="completed" class="value">0 / 0</div></div>
+          <div class="card"><div class="label">Failures</div><div id="failures" class="value">0</div></div>
+          <div class="card"><div class="label">Current Date</div><div id="tradeDate" class="value">-</div></div>
+          <div class="card"><div class="label">Current Snapshot</div><div id="snapshot" class="value">-</div></div>
+          <div class="card"><div class="label">Edges</div><div id="edges" class="value">-</div></div>
+          <div class="card"><div class="label">Updated</div><div id="updated" class="value">-</div></div>
+        </div>
+      </section>
+      <section class="panel">
+        <h2>Trade Date Progress</h2>
+        <div class="tabs">
+          <button id="tabRunning" class="tab active" type="button">处理中</button>
+          <button id="tabPending" class="tab" type="button">待处理</button>
+          <button id="tabCompleted" class="tab" type="button">已完成</button>
+        </div>
+        <div id="dateList"></div>
+      </section>
+      <section class="panel">
+        <h2>Recent Events</h2>
+        <div id="events"></div>
+      </section>
+      <section class="panel">
+        <h2>Current Payload</h2>
+        <div id="jsonBox" class="mono"></div>
+      </section>
+    </div>
+    <script>
+      const fill = document.getElementById("fill");
+      const runName = document.getElementById("runName");
+      const profile = document.getElementById("profile");
+      const status = document.getElementById("status");
+      const completed = document.getElementById("completed");
+      const failures = document.getElementById("failures");
+      const tradeDate = document.getElementById("tradeDate");
+      const snapshot = document.getElementById("snapshot");
+      const edges = document.getElementById("edges");
+      const updated = document.getElementById("updated");
+      const dateList = document.getElementById("dateList");
+      const events = document.getElementById("events");
+      const jsonBox = document.getElementById("jsonBox");
+      const tabRunning = document.getElementById("tabRunning");
+      const tabPending = document.getElementById("tabPending");
+      const tabCompleted = document.getElementById("tabCompleted");
+      let activeTab = "running";
+
+      function renderTradeDateTab(payload) {
+        const groups = payload.trade_date_groups || {};
+        const rows = Array.isArray(groups[activeTab]) ? groups[activeTab] : [];
+        dateList.innerHTML = rows.length === 0
+          ? '<div class="date-card"><div class="date-status">当前没有日期。</div></div>'
+          : rows.map((row) =>
+              '<div class="date-card">' +
+                '<div class="date-head">' +
+                  '<div class="date-name">' + row.trade_date + '</div>' +
+                  '<div class="date-status">' + row.completed_snapshots + ' / ' + row.planned_snapshots + ' snapshots</div>' +
+                '</div>' +
+                '<div class="meta">status=' + row.status +
+                ' | latest_snapshot=' + (row.latest_snapshot_clock || '-') +
+                ' | latest_event=' + (row.latest_status || '-') +
+                ' | remaining=' + row.remaining_snapshots +
+                ' | updated=' + (row.updated_at || '-') + '</div>' +
+                '<div class="mini-track"><div class="mini-fill" style="width:' + Number(row.progress_percent || 0).toFixed(2) + '%;"></div></div>' +
+              '</div>'
+            ).join("");
+        tabRunning.classList.toggle("active", activeTab === "running");
+        tabPending.classList.toggle("active", activeTab === "pending");
+        tabCompleted.classList.toggle("active", activeTab === "completed");
+      }
+
+      function render(payload) {
+        fill.style.width = (Number(payload.progress_percent || 0)).toFixed(2) + "%";
+        runName.textContent = payload.run_name || "-";
+        profile.textContent = payload.profile || "-";
+        status.textContent = payload.status || "-";
+        completed.textContent = String(payload.completed_snapshots || 0) + " / " + String(payload.planned_snapshots || 0);
+        failures.textContent = String(payload.failure_count || 0);
+        tradeDate.textContent = payload.current_trade_date || "-";
+        snapshot.textContent = payload.current_snapshot_clock || "-";
+        edges.textContent = payload.current_edge_count == null ? "-" : String(payload.current_edge_count);
+        updated.textContent = payload.updated_at || "-";
+        renderTradeDateTab(payload);
+        const rows = Array.isArray(payload.recent_events) ? payload.recent_events : [];
+        events.innerHTML = rows.map((row) =>
+          '<div class="event"><div><strong>' + (row.status || '-') + '</strong></div>' +
+          '<div class="meta">date=' + (row.trade_date || '-') +
+          ' | snapshot=' + (row.snapshot_clock || '-') +
+          ' | worker=' + (row.worker_pid || '-') +
+          ' | updated=' + (row.updated_at || '-') + '</div></div>'
+        ).join("");
+        jsonBox.textContent = JSON.stringify(payload, null, 2);
+      }
+
+      async function bootstrap() {
+        const initial = await fetch("/api/month-progress").then((res) => res.json());
+        render(initial);
+        const stream = new EventSource("/api/month-progress/stream");
+        stream.onmessage = (event) => {
+          try {
+            render(JSON.parse(event.data));
+          } catch (error) {
+            console.error(error);
+          }
+        };
+      }
+
+      tabRunning.addEventListener("click", () => { activeTab = "running"; fetch("/api/month-progress").then((res) => res.json()).then(render); });
+      tabPending.addEventListener("click", () => { activeTab = "pending"; fetch("/api/month-progress").then((res) => res.json()).then(render); });
+      tabCompleted.addEventListener("click", () => { activeTab = "completed"; fetch("/api/month-progress").then((res) => res.json()).then(render); });
+
+      bootstrap().catch((error) => {
+        jsonBox.textContent = "Failed to load progress: " + String(error);
+      });
+    </script>
+  </body>
+</html>`;
+}
+
 function getProgressPageHtml() {
   return `<!doctype html>
 <html lang="en">
@@ -448,6 +917,11 @@ function getProgressPageHtml() {
           <div class="card"><div class="card-label">GPU</div><div id="gpuValue" class="card-value">-</div></div>
           <div class="card"><div class="card-label">Updated</div><div id="updatedValue" class="card-value">-</div></div>
         </div>
+      </section>
+      <section class="panel" style="margin-bottom: 18px;">
+        <h2>Benchmark Status</h2>
+        <div class="window-meta">Current Candidate</div>
+        <div class="window-meta">Decision State</div>
       </section>
       <div class="layout">
         <section class="panel">
@@ -605,6 +1079,52 @@ function openProgressStream(req, res) {
   });
 }
 
+function openMonthProgressStream(req, res) {
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream; charset=utf-8",
+    "Cache-Control": "no-cache, no-transform",
+    Connection: "keep-alive",
+    "Access-Control-Allow-Origin": "*",
+  });
+  const emit = () => {
+    res.write(`data: ${JSON.stringify(buildMonthRunProgressSnapshot())}\n\n`);
+  };
+  emit();
+  const runRoot = getMonthRunRoot();
+  const watchTargets = [...new Set(
+    [
+      runRoot,
+      path.join(runRoot || "", "run_config.json"),
+      path.join(runRoot || "", "progress.jsonl"),
+      path.join(runRoot || "", "run.log"),
+      path.join(runRoot || "", "failures.jsonl"),
+    ]
+      .map((target) => resolveExistingWatchPath(target))
+      .filter(Boolean),
+  )];
+  const watchers = watchTargets.map((target) => {
+    try {
+      return fs.watch(target, { recursive: true }, () => emit());
+    } catch {
+      return fs.watch(target, () => emit());
+    }
+  });
+  const keepAlive = setInterval(() => {
+    res.write(": keep-alive\n\n");
+  }, 15000);
+  const emitInterval = setInterval(() => {
+    emit();
+  }, 1000);
+  req.on("close", () => {
+    clearInterval(keepAlive);
+    clearInterval(emitInterval);
+    for (const watcher of watchers) {
+      watcher.close();
+    }
+    res.end();
+  });
+}
+
 async function handleApi(req, res, url) {
   const pathname = url.pathname;
   if (pathname === "/api/progress") {
@@ -612,6 +1132,15 @@ async function handleApi(req, res, url) {
   }
   if (pathname === "/api/progress/stream") {
     return openProgressStream(req, res);
+  }
+  if (pathname === "/api/month-progress") {
+    return sendJson(res, 200, buildMonthRunProgressSnapshot());
+  }
+  if (pathname === "/api/month-progress/stream") {
+    return openMonthProgressStream(req, res);
+  }
+  if (pathname === "/api/benchmark-progress") {
+    return sendJson(res, 200, buildBenchmarkProgressSnapshot());
   }
   if (pathname === "/api/runs") {
     const runs = await queryRowObjects(`
@@ -762,6 +1291,9 @@ export function createServer() {
     try {
       const host = req.headers.host || `localhost:${DEFAULT_PORT}`;
       const url = new URL(req.url || "/", `http://${host}`);
+      if (req.method === "GET" && url.pathname === "/month-progress") {
+        return sendHtml(res, 200, getMonthProgressPageHtml());
+      }
       if (req.method === "GET" && url.pathname === "/progress") {
         return sendHtml(res, 200, getProgressPageHtml());
       }

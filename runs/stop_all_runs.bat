@@ -2,17 +2,16 @@
 setlocal EnableExtensions
 
 set "ROOT=%~dp0.."
-echo [INFO] Stopping all StockNetV2 month run processes...
+set "RUN_ROOT=%ROOT%\research_runs"
 
-powershell -NoProfile -Command ^
-  "$root='%ROOT%';" ^
-  "$runRoot=Join-Path $root 'research_runs';" ^
-  "$pids=@();" ^
-  "if(Test-Path $runRoot){ Get-ChildItem -Path $runRoot -Recurse -Filter 'run.pid' -ErrorAction SilentlyContinue | ForEach-Object { try { $pids += [int](Get-Content $_.FullName | Select-Object -First 1) } catch {} } };" ^
-  "$pids = $pids | Select-Object -Unique;" ^
-  "foreach($mainPid in $pids){ Get-CimInstance Win32_Process | Where-Object { $_.ParentProcessId -eq $mainPid } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }; Stop-Process -Id $mainPid -Force -ErrorAction SilentlyContinue };" ^
-  "Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'python.exe' -and $_.CommandLine -like '*run_month_graph_compute.py*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue };" ^
-  "if(Test-Path $runRoot){ Get-ChildItem -Path $runRoot -Recurse -Filter 'run.pid' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue }"
+echo [INFO] taskkill python.exe /T ...
+taskkill /F /IM python.exe /T
+
+if exist "%RUN_ROOT%" (
+    del /S /Q "%RUN_ROOT%\run.pid" >nul 2>nul
+    del /S /Q "%RUN_ROOT%\monitor.pid" >nul 2>nul
+    del /S /Q "%RUN_ROOT%\monitor.port" >nul 2>nul
+)
 
 echo [INFO] Stop-all signal completed.
 pause

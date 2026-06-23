@@ -308,6 +308,90 @@ test("server keeps progress stream alive when progress files are not created yet
   delete process.env.STOCKNETV2_LOG_FILE;
 });
 
+test("server exposes lightweight month progress api and page", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "stocknetv2-month-progress-"));
+  const databasePath = path.join(tempDir, "stocknetv2.duckdb");
+  await seedDatabase(databasePath);
+
+  fs.writeFileSync(
+    path.join(tempDir, "run_config.json"),
+    JSON.stringify(
+      {
+        run_name: "month_run_demo",
+        profile: "cpu_full",
+        resume_mode: "off",
+        date_start: "2026-01-02",
+        date_end: "2026-01-03",
+        planned_snapshots: 100,
+        pending_snapshots: 88,
+        trade_dates: [
+          { trade_date: "2026-01-02", month: "2026-01", planned_snapshots: 78 },
+          { trade_date: "2026-01-03", month: "2026-01", planned_snapshots: 22 },
+        ],
+      },
+      null,
+      2,
+    ),
+  );
+  fs.mkdirSync(path.join(tempDir, "month=2026-01", "dates", "date=2026-01-02", "snapshots", "snapshot=1435"), { recursive: true });
+  fs.writeFileSync(path.join(tempDir, "month=2026-01", "dates", "date=2026-01-02", "snapshots", "snapshot=1435", "_PROFILE_SUCCESS"), "");
+  fs.writeFileSync(
+    path.join(tempDir, "progress.jsonl"),
+    [
+      JSON.stringify({
+        status: "snapshot_started",
+        trade_date: "2026-01-02",
+        snapshot_id: "2026-01-02T14:35:00+00:00",
+        snapshot_clock: "1435",
+        updated_at: "2026-06-23T07:00:00+00:00",
+      }),
+      JSON.stringify({
+        status: "snapshot_complete",
+        trade_date: "2026-01-02",
+        snapshot_id: "2026-01-02T14:35:00+00:00",
+        snapshot_clock: "1435",
+        worker_pid: 1234,
+        updated_at: "2026-06-23T07:00:05+00:00",
+      }),
+    ].join("\n"),
+  );
+  fs.writeFileSync(
+    path.join(tempDir, "run.log"),
+    JSON.stringify({
+      status: "snapshot_complete",
+      trade_date: "2026-01-02",
+      snapshot_id: "2026-01-02T14:35:00+00:00",
+      snapshot_clock: "1435",
+      edge_count: 321,
+      worker_pid: 1234,
+      updated_at: "2026-06-23T07:00:05+00:00",
+    }) + "\n",
+  );
+
+  process.env.STOCKNETV2_MONTH_RUN_ROOT = tempDir;
+  await withServer(databasePath, async (baseUrl) => {
+    const progressRes = await fetch(`${baseUrl}/api/month-progress`);
+    assert.equal(progressRes.status, 200);
+    const payload = await progressRes.json();
+    assert.equal(payload.run_name, "month_run_demo");
+    assert.equal(payload.completed_snapshots, 1);
+    assert.equal(payload.current_snapshot_clock, "1435");
+    assert.equal(payload.current_edge_count, 321);
+    assert.equal(payload.trade_date_groups.running[0].trade_date, "2026-01-02");
+    assert.equal(payload.trade_date_groups.completed.length, 0);
+    assert.equal(payload.trade_date_groups.pending[0].trade_date, "2026-01-03");
+
+    const pageRes = await fetch(`${baseUrl}/month-progress`);
+    assert.equal(pageRes.status, 200);
+    const pageHtml = await pageRes.text();
+    assert.match(pageHtml, /StockNetV2 Month Run Progress/);
+    assert.match(pageHtml, /EventSource\("\/api\/month-progress\/stream"\)/);
+    assert.match(pageHtml, /处理中/);
+    assert.match(pageHtml, /已完成/);
+  });
+  delete process.env.STOCKNETV2_MONTH_RUN_ROOT;
+});
+
 test("server exposes benchmark progress api and renders benchmark details on progress page", async () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "stocknetv2-benchmark-"));
   const databasePath = path.join(tempDir, "stocknetv2.duckdb");

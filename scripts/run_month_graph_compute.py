@@ -8,6 +8,7 @@ from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
+from collections import Counter
 
 import pandas as pd
 
@@ -155,10 +156,13 @@ def main() -> int:
             "month_pack_roots": [str(path) for path in month_pack_roots],
             "profile": profile.name,
             "resume_mode": args.resume_mode,
+            "date_start": args.date_start,
+            "date_end": args.date_end,
             "snapshot_block_size": args.snapshot_block_size,
             "max_workers": args.max_workers,
             "planned_snapshots": len(schedule),
             "pending_snapshots": len(pending_schedule),
+            "trade_dates": _build_trade_date_plan(schedule),
         },
     )
 
@@ -449,6 +453,19 @@ def _append_failure(failures_path: Path, block_id: str, exc: Exception) -> None:
 
 def _write_run_config(*, output_root: Path, payload: dict[str, object]) -> None:
     (output_root / "run_config.json").write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def _build_trade_date_plan(schedule: list[SnapshotSpec]) -> list[dict[str, object]]:
+    snapshot_counts = Counter(snapshot.trade_date for snapshot in schedule)
+    month_map = {snapshot.trade_date: snapshot.trade_date[:7] for snapshot in schedule}
+    return [
+        {
+            "trade_date": trade_date,
+            "month": month_map[trade_date],
+            "planned_snapshots": int(snapshot_counts[trade_date]),
+        }
+        for trade_date in sorted(snapshot_counts)
+    ]
 
 
 def _snapshot_root(output_root: Path, snapshot: SnapshotSpec) -> Path:
