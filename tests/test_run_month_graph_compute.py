@@ -134,10 +134,13 @@ def test_run_month_graph_compute_skips_logged_snapshot_and_computes_remaining(tm
     assert run_month_graph_compute.main() == 0
     second_snapshot_root = output_root / "month=2025-01" / "dates" / "date=2025-01-02" / "snapshots" / "snapshot=0940"
     log_text = (output_root / "run.log").read_text(encoding="utf-8")
+    progress_text = (output_root / "progress.jsonl").read_text(encoding="utf-8")
 
     assert second_snapshot_root.exists()
     assert log_text.count("2025-01-02_0935") == 1
     assert "2025-01-02_0940" in log_text
+    assert '"status": "snapshot_started"' in progress_text
+    assert '"status": "snapshot_complete"' in progress_text
     diagnostics = json.loads((second_snapshot_root / "diagnostics.json").read_text(encoding="utf-8"))
     status_payload = json.loads((second_snapshot_root / "status.json").read_text(encoding="utf-8"))
     assert diagnostics["bars_5m_timestamp_semantics"] == "bar_end_utc"

@@ -57,6 +57,18 @@ def test_month_pack_read_repository_filters_snapshot_window(tmp_path):
             "flow_impulse_score": [0.5, 0.6, 0.7],
         }
     ).to_parquet(date_root / "graph_features_1m.parquet", index=False)
+    pd.DataFrame(
+        {
+            "ticker": ["AAA", "AAA"],
+            "minute": [
+                datetime(2025, 1, 2, 14, 35, tzinfo=UTC),
+                datetime(2025, 1, 2, 14, 39, tzinfo=UTC),
+            ],
+            "dollar_volume": [1000.0, 1200.0],
+            "large_trade_dollar_volume": [100.0, 180.0],
+            "imbalance_proxy": [0.2, -0.1],
+        }
+    ).to_parquet(date_root / "trade_flow_1m.parquet", index=False)
 
     repository = MonthPackReadRepository(pack_root)
     schedule = repository.load_snapshot_schedule("2025-01-02")
@@ -64,8 +76,13 @@ def test_month_pack_read_repository_filters_snapshot_window(tmp_path):
         trade_date="2025-01-02",
         window_start=pd.Timestamp("2025-01-02T14:34:00Z"),
         window_end=pd.Timestamp("2025-01-02T14:39:00Z"),
+        include_trade_flow=True,
     )
 
     assert [snapshot.snapshot_id for snapshot in schedule] == ["2025-01-02_0935", "2025-01-02_0940"]
     assert inputs.bars_5m["timestamp"].dt.strftime("%H:%M").tolist() == ["14:35"]
     assert inputs.features_1m["timestamp"].dt.strftime("%H:%M").tolist() == ["14:35", "14:39"]
+    assert inputs.trade_flow_1m["timestamp"].dt.strftime("%H:%M").tolist() == ["14:35", "14:39"]
+    assert inputs.trade_flow_1m["symbol"].tolist() == ["AAA", "AAA"]
+    assert inputs.trade_flow_1m["large_trade_ratio_z"].tolist() == [0.1, 0.15]
+    assert len(inputs.trade_flow_1m) == 2

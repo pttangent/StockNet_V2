@@ -25,6 +25,45 @@ from stocknetv2.infrastructure.project_paths import ProjectPaths
 from stocknetv2.infrastructure.repositories.month_pack_read_repository import MonthPackReadRepository, SnapshotSpec
 from stocknetv2.infrastructure.repositories.snapshot_artifact_repository import SnapshotArtifactRepository
 
+MODE_DEFAULTS = {
+    "cpu_no_dtw": {
+        "graph_backend": "cpu_numpy",
+        "graph_torch_device": "cpu",
+        "dtw_backend": "cpu_python",
+        "dtw_torch_device": "cpu",
+    },
+    "cpu_full": {
+        "graph_backend": "cpu_numpy",
+        "graph_torch_device": "cpu",
+        "dtw_backend": "cpu_python",
+        "dtw_torch_device": "cpu",
+    },
+    "cpu_dtw_only": {
+        "graph_backend": "cpu_numpy",
+        "graph_torch_device": "cpu",
+        "dtw_backend": "cpu_python",
+        "dtw_torch_device": "cpu",
+    },
+    "cpu_only_dtw": {
+        "graph_backend": "cpu_numpy",
+        "graph_torch_device": "cpu",
+        "dtw_backend": "cpu_python",
+        "dtw_torch_device": "cpu",
+    },
+    "hybird_full": {
+        "graph_backend": "cpu_numpy",
+        "graph_torch_device": "cpu",
+        "dtw_backend": "torch_cuda",
+        "dtw_torch_device": "cuda",
+    },
+    "gpu_only_dtw": {
+        "graph_backend": "cpu_numpy",
+        "graph_torch_device": "cpu",
+        "dtw_backend": "torch_cuda",
+        "dtw_torch_device": "cuda",
+    },
+}
+
 
 def parse_args() -> argparse.Namespace:
     project_paths = ProjectPaths.discover(ROOT_DIR)
@@ -34,7 +73,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--month-pack-root", help="Month pack root. Overrides --month.")
     parser.add_argument("--output-root", help="Run output root.")
     parser.add_argument("--run-name", required=True)
-    parser.add_argument("--profile", default="cpu_no_dtw", choices=("cpu_no_dtw", "cpu_full", "cpu_dtw_only"))
+    parser.add_argument("--profile", default="cpu_no_dtw", choices=tuple(MODE_DEFAULTS))
     parser.add_argument("--max-workers", type=int, default=1)
     parser.add_argument("--snapshot-block-size", type=int, default=8)
     parser.add_argument("--max-tasks-per-child", type=int, default=4)
@@ -46,7 +85,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--snapshot-ids", nargs="*")
     parser.add_argument("--resume-mode", default="log", choices=("off", "log"))
     parser.add_argument("--continue-on-error", action="store_true")
-    parser.add_argument("--cpu-dtw-backend", default="cpu_python", choices=("cpu_python", "torch_cpu"))
+    parser.add_argument("--graph-backend", choices=("cpu_numpy", "torch_cpu", "torch_cuda", "torch_auto"))
+    parser.add_argument("--graph-torch-device", default=None)
+    parser.add_argument("--dtw-backend", dest="dtw_backend", choices=("cpu_python", "torch_cpu", "torch_cuda", "torch_auto"))
+    parser.add_argument("--cpu-dtw-backend", dest="dtw_backend", choices=("cpu_python", "torch_cpu", "torch_cuda", "torch_auto"))
+    parser.add_argument("--dtw-torch-device", default=None)
     parser.add_argument("--dtw-pair-batch-size", type=int, default=1024)
     parser.add_argument("--system-memory-reserve-gb", type=int, default=10)
     parser.add_argument("--threads-per-worker", type=int, default=1)
@@ -68,11 +111,12 @@ def main() -> int:
     if not month_pack_roots:
         raise RuntimeError("No month packs found for the requested inputs.")
 
+    mode_defaults = MODE_DEFAULTS[args.profile]
     settings = build_theme_discovery_settings(
-        graph_backend="cpu_numpy",
-        graph_torch_device="cpu",
-        dtw_backend=args.cpu_dtw_backend,
-        dtw_torch_device="cpu",
+        graph_backend=args.graph_backend or str(mode_defaults["graph_backend"]),
+        graph_torch_device=args.graph_torch_device or str(mode_defaults["graph_torch_device"]),
+        dtw_backend=args.dtw_backend or str(mode_defaults["dtw_backend"]),
+        dtw_torch_device=args.dtw_torch_device or str(mode_defaults["dtw_torch_device"]),
         dtw_torch_batch_pair_threshold=max(1, args.dtw_pair_batch_size),
     )
     profile = resolve_layer_profile(args.profile, settings)
@@ -88,6 +132,7 @@ def main() -> int:
         raise RuntimeError("No snapshots matched the requested range.")
 
     run_log_path = output_root / "run.log"
+    progress_path = output_root / "progress.jsonl"
     failures_path = output_root / "failures.jsonl"
     completed_ids = SnapshotResumeService().load_completed_snapshot_ids(run_log_path) if args.resume_mode == "log" else set()
     artifact_repository = SnapshotArtifactRepository()
@@ -127,13 +172,17 @@ def main() -> int:
         output_root=output_root,
         run_name=args.run_name,
         profile_name=profile.name,
-        dtw_backend=args.cpu_dtw_backend,
+        dtw_backend=args.dtw_backend or str(mode_defaults["dtw_backend"]),
+        graph_backend=args.graph_backend or str(mode_defaults["graph_backend"]),
+        graph_torch_device=args.graph_torch_device or str(mode_defaults["graph_torch_device"]),
+        dtw_torch_device=args.dtw_torch_device or str(mode_defaults["dtw_torch_device"]),
         dtw_pair_batch_size=args.dtw_pair_batch_size,
         max_workers=max(1, args.max_workers),
         max_tasks_per_child=max(1, args.max_tasks_per_child),
         max_in_flight_tasks=max(1, args.max_in_flight_tasks),
         continue_on_error=args.continue_on_error,
         run_log_path=run_log_path,
+        progress_path=progress_path,
         failures_path=failures_path,
     )
     print(
@@ -215,13 +264,17 @@ def _run_tasks(
     output_root: Path,
     run_name: str,
     profile_name: str,
+    graph_backend: str,
+    graph_torch_device: str,
     dtw_backend: str,
+    dtw_torch_device: str,
     dtw_pair_batch_size: int,
     max_workers: int,
     max_tasks_per_child: int,
     max_in_flight_tasks: int,
     continue_on_error: bool,
     run_log_path: Path,
+    progress_path: Path,
     failures_path: Path,
 ) -> int:
     if max_workers <= 1:
@@ -234,8 +287,12 @@ def _run_tasks(
                         "output_root": str(output_root),
                         "run_name": run_name,
                         "profile_name": profile_name,
+                        "graph_backend": graph_backend,
+                        "graph_torch_device": graph_torch_device,
                         "dtw_backend": dtw_backend,
+                        "dtw_torch_device": dtw_torch_device,
                         "dtw_pair_batch_size": dtw_pair_batch_size,
+                        "progress_path": str(progress_path),
                         "trade_date": task.trade_date,
                         "window_start": task.window_start.isoformat(),
                         "window_end": task.window_end.isoformat(),
@@ -267,8 +324,12 @@ def _run_tasks(
                         "output_root": str(output_root),
                         "run_name": run_name,
                         "profile_name": profile_name,
+                        "graph_backend": graph_backend,
+                        "graph_torch_device": graph_torch_device,
                         "dtw_backend": dtw_backend,
+                        "dtw_torch_device": dtw_torch_device,
                         "dtw_pair_batch_size": dtw_pair_batch_size,
+                        "progress_path": str(progress_path),
                         "trade_date": task.trade_date,
                         "window_start": task.window_start.isoformat(),
                         "window_end": task.window_end.isoformat(),
@@ -294,10 +355,10 @@ def _run_tasks(
 def _run_block_worker(payload: dict[str, object]) -> list[dict[str, object]]:
     repository = MonthPackReadRepository(str(payload["month_pack_root"]))
     settings = build_theme_discovery_settings(
-        graph_backend="cpu_numpy",
-        graph_torch_device="cpu",
+        graph_backend=str(payload["graph_backend"]),
+        graph_torch_device=str(payload["graph_torch_device"]),
         dtw_backend=str(payload["dtw_backend"]),
-        dtw_torch_device="cpu",
+        dtw_torch_device=str(payload["dtw_torch_device"]),
         dtw_torch_batch_pair_threshold=max(1, int(payload["dtw_pair_batch_size"])),
     )
     profile = resolve_layer_profile(str(payload["profile_name"]), settings)
@@ -311,7 +372,22 @@ def _run_block_worker(payload: dict[str, object]) -> list[dict[str, object]]:
         )
         for item in payload["snapshots"]
     ]
+    progress_path = Path(str(payload["progress_path"]))
     service = SnapshotBlockGraphBuildService(repository=repository)
+    for snapshot in snapshots:
+        _append_progress_event(
+            progress_path,
+            {
+                "status": "snapshot_started",
+                "run_name": payload["run_name"],
+                "trade_date": snapshot.trade_date,
+                "snapshot_id": snapshot.snapshot_id,
+                "snapshot_clock": snapshot.snapshot_clock,
+                "profile": payload["profile_name"],
+                "worker_pid": None,
+                "updated_at": datetime.now(UTC).isoformat(),
+            },
+        )
     results = service.run_block(
         trade_date=str(payload["trade_date"]),
         snapshots=snapshots,
@@ -322,7 +398,7 @@ def _run_block_worker(payload: dict[str, object]) -> list[dict[str, object]]:
         output_root=Path(str(payload["output_root"])),
         run_name=str(payload["run_name"]),
     )
-    return [
+    completed_rows = [
         {
             "status": "snapshot_complete",
             "run_name": payload["run_name"],
@@ -339,6 +415,9 @@ def _run_block_worker(payload: dict[str, object]) -> list[dict[str, object]]:
         }
         for result in results
     ]
+    for row in completed_rows:
+        _append_progress_event(progress_path, row)
+    return completed_rows
 
 
 def _append_run_log(run_log_path: Path, rows: list[dict[str, object]]) -> None:
@@ -346,6 +425,12 @@ def _append_run_log(run_log_path: Path, rows: list[dict[str, object]]) -> None:
     with run_log_path.open("a", encoding="utf-8") as handle:
         for row in rows:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def _append_progress_event(progress_path: Path, row: dict[str, object]) -> None:
+    progress_path.parent.mkdir(parents=True, exist_ok=True)
+    with progress_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
 def _append_failure(failures_path: Path, block_id: str, exc: Exception) -> None:

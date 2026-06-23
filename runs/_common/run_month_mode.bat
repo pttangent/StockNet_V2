@@ -1,0 +1,173 @@
+@echo off
+setlocal EnableExtensions
+
+if not defined MODE_NAME (
+    echo [ERROR] MODE_NAME is not set.
+    pause
+    exit /b 1
+)
+if not defined PROFILE (
+    echo [ERROR] PROFILE is not set.
+    pause
+    exit /b 1
+)
+if not defined RESUME_MODE (
+    echo [ERROR] RESUME_MODE is not set.
+    pause
+    exit /b 1
+)
+if not defined RUN_NAME (
+    echo [ERROR] RUN_NAME is not set.
+    pause
+    exit /b 1
+)
+
+set "ROOT=%~dp0..\.."
+set "PACK_ROOT=%ROOT%\data\ready"
+
+if not defined DATE_START set "DATE_START=2026-01-01"
+if not defined DATE_END set "DATE_END=2026-05-30"
+if not defined SNAPSHOT_START set "SNAPSHOT_START="
+if not defined SNAPSHOT_END set "SNAPSHOT_END="
+if not defined MAX_WORKERS set "MAX_WORKERS=18"
+if not defined SNAPSHOT_BLOCK_SIZE set "SNAPSHOT_BLOCK_SIZE=8"
+if not defined MAX_TASKS_PER_CHILD set "MAX_TASKS_PER_CHILD=4"
+if not defined MAX_IN_FLIGHT_TASKS set "MAX_IN_FLIGHT_TASKS=22"
+if not defined DTW_PAIR_BATCH_SIZE set "DTW_PAIR_BATCH_SIZE=1024"
+if not defined WRAPPER_NAME set "WRAPPER_NAME=%~nx0"
+if not defined ORIGINAL_BAT_PATH set "ORIGINAL_BAT_PATH=%~f0"
+
+set "OUTPUT_ROOT=%ROOT%\research_runs\%RUN_NAME%"
+set "RUN_SCRIPT=%ROOT%\scripts\run_month_graph_compute.py"
+set "RUN_BAT_ARCHIVE=%OUTPUT_ROOT%\%WRAPPER_NAME%"
+set "RUN_STDOUT=%OUTPUT_ROOT%\launcher.stdout.log"
+set "RUN_STDERR=%OUTPUT_ROOT%\launcher.stderr.log"
+set "RUN_LOG=%OUTPUT_ROOT%\run.log"
+set "RUN_PROGRESS=%OUTPUT_ROOT%\progress.jsonl"
+set "RUN_PID_FILE=%OUTPUT_ROOT%\run.pid"
+
+if /I "%~1"=="stop" goto STOP_RUN
+
+where python >nul 2>nul
+if errorlevel 1 (
+    echo [ERROR] Python was not found in PATH.
+    pause
+    exit /b 1
+)
+
+if not exist "%RUN_SCRIPT%" (
+    echo [ERROR] Missing run script:
+    echo         %RUN_SCRIPT%
+    pause
+    exit /b 1
+)
+
+if not exist "%PACK_ROOT%" (
+    echo [ERROR] Missing pack root:
+    echo         %PACK_ROOT%
+    pause
+    exit /b 1
+)
+
+if not exist "%OUTPUT_ROOT%" mkdir "%OUTPUT_ROOT%"
+copy /Y "%ORIGINAL_BAT_PATH%" "%RUN_BAT_ARCHIVE%" >nul
+
+set "PYTHONUTF8=1"
+set "PYTHONUNBUFFERED=1"
+set "OMP_NUM_THREADS=1"
+set "MKL_NUM_THREADS=1"
+set "OPENBLAS_NUM_THREADS=1"
+set "NUMEXPR_NUM_THREADS=1"
+set "VECLIB_MAXIMUM_THREADS=1"
+
+echo.
+echo ============================================================
+if /I "%RESUME_MODE%"=="log" (
+    echo Starting StockNetV2 %MODE_NAME% resume run
+) else (
+    echo Starting StockNetV2 %MODE_NAME% fresh run
+)
+echo ============================================================
+echo Run name       : %RUN_NAME%
+echo Mode           : %MODE_NAME%
+echo Profile        : %PROFILE%
+echo Date start     : %DATE_START%
+echo Date end       : %DATE_END%
+echo Date workers   : %MAX_WORKERS%
+echo Layer workers  : 1
+echo Resume mode    : %RESUME_MODE%
+if defined DTW_BACKEND echo DTW backend    : %DTW_BACKEND%
+if defined DTW_TORCH_DEVICE echo DTW device     : %DTW_TORCH_DEVICE%
+echo Output root    : %OUTPUT_ROOT%
+echo ============================================================
+echo.
+
+set "STATUS_LINE=Launching python worker..."
+for /f %%I in ('powershell -NoProfile -Command "$argsList=@('%RUN_SCRIPT%','--pack-root','%PACK_ROOT%','--output-root','%OUTPUT_ROOT%','--run-name','%RUN_NAME%','--profile','%PROFILE%','--date-start','%DATE_START%','--date-end','%DATE_END%','--max-workers','%MAX_WORKERS%','--snapshot-block-size','%SNAPSHOT_BLOCK_SIZE%','--max-tasks-per-child','%MAX_TASKS_PER_CHILD%','--max-in-flight-tasks','%MAX_IN_FLIGHT_TASKS%','--resume-mode','%RESUME_MODE%','--dtw-pair-batch-size','%DTW_PAIR_BATCH_SIZE%'); if('%SNAPSHOT_START%' -ne ''){ $argsList += @('--snapshot-start','%SNAPSHOT_START%') }; if('%SNAPSHOT_END%' -ne ''){ $argsList += @('--snapshot-end','%SNAPSHOT_END%') }; if('%DTW_BACKEND%' -ne ''){ $argsList += @('--dtw-backend','%DTW_BACKEND%') }; if('%DTW_TORCH_DEVICE%' -ne ''){ $argsList += @('--dtw-torch-device','%DTW_TORCH_DEVICE%') }; if('%GRAPH_BACKEND%' -ne ''){ $argsList += @('--graph-backend','%GRAPH_BACKEND%') }; if('%GRAPH_TORCH_DEVICE%' -ne ''){ $argsList += @('--graph-torch-device','%GRAPH_TORCH_DEVICE%') }; $p=Start-Process python -ArgumentList $argsList -RedirectStandardOutput '%RUN_STDOUT%' -RedirectStandardError '%RUN_STDERR%' -PassThru -WindowStyle Hidden; $p.Id"') do set "RUN_PID=%%I"
+if not defined RUN_PID (
+    echo [ERROR] Failed to start python process.
+    if exist "%RUN_STDERR%" powershell -NoProfile -Command "Get-Content '%RUN_STDERR%' -Tail 20"
+    pause
+    exit /b 1
+)
+> "%RUN_PID_FILE%" echo %RUN_PID%
+
+echo [INFO] Python PID: %RUN_PID%
+echo [INFO] Stop command: "%WRAPPER_NAME%" stop
+echo [INFO] Monitoring progress.jsonl for progress...
+
+:MONITOR
+tasklist /FI "PID eq %RUN_PID%" 2>nul | find "%RUN_PID%" >nul
+if errorlevel 1 goto DONE
+
+for /f "usebackq delims=" %%L in (`powershell -NoProfile -Command "$progress='%RUN_PROGRESS%'; $config='%OUTPUT_ROOT%\run_config.json'; $failures='%OUTPUT_ROOT%\failures.jsonl'; $planned=0; if(Test-Path $config){ try { $planned=[int]((Get-Content $config -Raw | ConvertFrom-Json).planned_snapshots) } catch {} }; $completed=(Get-ChildItem -Path '%OUTPUT_ROOT%' -Recurse -Filter '_PROFILE_SUCCESS' -ErrorAction SilentlyContinue | Measure-Object).Count; $failureCount=0; if(Test-Path $failures){ $failureCount=(Get-Content $failures | Measure-Object).Count }; if(!(Test-Path $progress)){ 'Progress: completed='+$completed+'/'+$planned+' failures='+$failureCount+' status=starting'; exit }; $lines=Get-Content $progress; if($lines.Count -eq 0){ 'Progress: completed='+$completed+'/'+$planned+' failures='+$failureCount+' status=starting'; exit }; $obj=$lines[-1] | ConvertFrom-Json; $snapshotText=$obj.snapshot_clock; try { $ts=[datetimeoffset]::Parse($obj.snapshot_id); $tz=[System.TimeZoneInfo]::FindSystemTimeZoneById('Eastern Standard Time'); $ny=[System.TimeZoneInfo]::ConvertTime($ts,$tz); $snapshotText=([int]((($ny.Hour*60+$ny.Minute)-(9*60+35))/5)+1).ToString()+'/78 market_clock='+$ny.ToString('HH:mm') } catch {}; $worker='n/a'; if($obj.worker_pid){ $worker=[string]$obj.worker_pid }; $edges='n/a'; if($obj.PSObject.Properties.Name -contains 'edge_count'){ $edges=[string]$obj.edge_count }; 'Progress: completed='+$completed+'/'+$planned+' failures='+$failureCount+' current_status='+$obj.status+' date='+$obj.trade_date+' snapshot='+$snapshotText+' edges='+$edges+' worker='+$worker"`) do set "STATUS_LINE=%%L"
+
+cls
+echo ============================================================
+echo StockNetV2 %MODE_NAME% monitor
+echo ============================================================
+echo Run name       : %RUN_NAME%
+echo Date range     : %DATE_START% ^> %DATE_END%
+echo Date workers   : %MAX_WORKERS%
+echo Profile        : %PROFILE%
+echo PID            : %RUN_PID%
+echo.
+echo %STATUS_LINE%
+echo.
+echo Logs:
+echo   %RUN_PROGRESS%
+echo   %RUN_LOG%
+echo   %RUN_STDERR%
+echo ============================================================
+timeout /t 5 /nobreak >nul
+goto MONITOR
+
+:DONE
+echo.
+echo [INFO] Run process exited.
+if exist "%RUN_STDERR%" (
+  for %%S in ("%RUN_STDERR%") do if %%~zS GTR 0 (
+    echo [WARN] stderr is not empty:
+    powershell -NoProfile -Command "Get-Content '%RUN_STDERR%' -Tail 20"
+  )
+)
+echo [INFO] stdout: %RUN_STDOUT%
+echo [INFO] stderr: %RUN_STDERR%
+pause
+
+endlocal
+exit /b 0
+
+:STOP_RUN
+echo [INFO] Stopping run processes for %RUN_NAME%...
+powershell -NoProfile -Command ^
+  "$pidFile='%RUN_PID_FILE%';" ^
+  "$runName='%RUN_NAME%';" ^
+  "$mainPid=$null;" ^
+  "if(Test-Path $pidFile){ try { $mainPid=[int](Get-Content $pidFile | Select-Object -First 1) } catch {} };" ^
+  "if($mainPid){ Get-CimInstance Win32_Process | Where-Object { $_.ParentProcessId -eq $mainPid } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }; Stop-Process -Id $mainPid -Force -ErrorAction SilentlyContinue };" ^
+  "Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'python.exe' -and $_.CommandLine -like ('*' + $runName + '*') -and $_.CommandLine -like '*run_month_graph_compute.py*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue };" ^
+  "if(Test-Path $pidFile){ Remove-Item $pidFile -Force -ErrorAction SilentlyContinue }"
+echo [INFO] Stop signal completed.
+pause
+endlocal

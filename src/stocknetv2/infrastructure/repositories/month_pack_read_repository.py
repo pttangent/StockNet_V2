@@ -4,6 +4,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
 
@@ -124,10 +125,13 @@ class MonthPackReadRepository:
         )
         trade_flow_1m = pd.DataFrame()
         if include_trade_flow:
-            trade_flow_1m = self._read_filtered_parquet(
-                date_root / "trade_flow_1m.parquet",
-                window_start=window_start,
-                window_end=window_end,
+            trade_flow_1m = self._normalize_trade_flow_1m(
+                self._read_filtered_parquet(
+                    date_root / "trade_flow_1m.parquet",
+                    timestamp_column="minute",
+                    window_start=window_start,
+                    window_end=window_end,
+                )
             )
         return SnapshotBlockInputs(
             trade_date=trade_date,
@@ -147,6 +151,7 @@ class MonthPackReadRepository:
         path: Path,
         *,
         columns: list[str] | None = None,
+        timestamp_column: str = "timestamp",
         window_start: pd.Timestamp,
         window_end: pd.Timestamp,
     ) -> pd.DataFrame:
@@ -159,17 +164,53 @@ class MonthPackReadRepository:
             if not resolved_columns:
                 resolved_columns = None
         filters = []
-        if "timestamp" in available_columns:
-            filters = [("timestamp", ">=", window_start.to_pydatetime()), ("timestamp", "<=", window_end.to_pydatetime())]
+        if timestamp_column in available_columns:
+            filters = [
+                (timestamp_column, ">=", window_start.to_pydatetime()),
+                (timestamp_column, "<=", window_end.to_pydatetime()),
+            ]
         try:
             frame = pd.read_parquet(path, columns=resolved_columns, filters=filters or None)
         except Exception:
             frame = pd.read_parquet(path, columns=resolved_columns)
-        if "timestamp" in frame.columns:
-            frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True, errors="coerce")
-            frame = frame.loc[(frame["timestamp"] >= window_start) & (frame["timestamp"] <= window_end)].copy()
+        if timestamp_column in frame.columns:
+            frame[timestamp_column] = pd.to_datetime(frame[timestamp_column], utc=True, errors="coerce")
+            frame = frame.loc[(frame[timestamp_column] >= window_start) & (frame[timestamp_column] <= window_end)].copy()
         if "available_time" in frame.columns:
             frame["available_time"] = pd.to_datetime(frame["available_time"], utc=True, errors="coerce")
         if "bar_end" in frame.columns:
             frame["bar_end"] = pd.to_datetime(frame["bar_end"], utc=True, errors="coerce")
         return frame
+
+    @staticmethod
+    def _normalize_trade_flow_1m(frame: pd.DataFrame) -> pd.DataFrame:
+        if frame.empty:
+            return pd.DataFrame(columns=["symbol", "timestamp"])
+        normalized = frame.copy()
+        if "ticker" in normalized.columns:
+            normalized = normalized.rename(columns={"ticker": "symbol"})
+        if "minute" in normalized.columns:
+            normalized = normalized.rename(columns={"minute": "timestamp"})
+        if "timestamp" in normalized.columns:
+            normalized["timestamp"] = pd.to_datetime(normalized["timestamp"], utc=True, errors="coerce")
+        if "available_time" in normalized.columns:
+            normalized["available_time"] = pd.to_datetime(normalized["available_time"], utc=True, errors="coerce")
+        else:
+            normalized["available_time"] = normalized["timestamp"] if "timestamp" in normalized.columns else pd.NaT
+        if "imbalance_proxy" in normalized.columns and "imbalance_z" not in normalized.columns:
+            normalized = normalized.rename(columns={"imbalance_proxy": "imbalance_z"})
+        if "flow_impulse_score" not in normalized.columns:
+            if "imbalance_z" in normalized.columns:
+                normalized["flow_impulse_score"] = pd.to_numeric(normalized["imbalance_z"], errors="coerce").fillna(0.0)
+            else:
+                normalized["flow_impulse_score"] = 0.0
+        if "large_trade_ratio_z" not in normalized.columns:
+            if "large_trade_dollar_volume" in normalized.columns and "dollar_volume" in normalized.columns:
+                dollar_volume = pd.to_numeric(normalized["dollar_volume"], errors="coerce").replace(0.0, np.nan)
+                normalized["large_trade_ratio_z"] = (
+                    pd.to_numeric(normalized["large_trade_dollar_volume"], errors="coerce").fillna(0.0)
+                    / dollar_volume.astype(float)
+                ).fillna(0.0)
+            else:
+                normalized["large_trade_ratio_z"] = 0.0
+        return normalized

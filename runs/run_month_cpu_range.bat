@@ -3,8 +3,8 @@ setlocal EnableExtensions
 
 set "ROOT=%~dp0.."
 set "PACK_ROOT=%ROOT%\data\ready"
-set "RUN_NAME=run_2026_01_01_2026_05_30_cpu18"
-set "PROFILE=cpu_no_dtw"
+set "RUN_NAME=run_2026_01_01_2026_05_30_cpu18_cpu_only_dtw"
+set "PROFILE=cpu_only_dtw"
 
 set "DATE_START=2026-01-01"
 set "DATE_END=2026-05-30"
@@ -75,7 +75,14 @@ echo Output root    : %OUTPUT_ROOT%
 echo ============================================================
 echo.
 
-for /f %%I in ('powershell -NoProfile -Command "$p=Start-Process python -ArgumentList @('%RUN_SCRIPT%','--pack-root','%PACK_ROOT%','--output-root','%OUTPUT_ROOT%','--run-name','%RUN_NAME%','--profile','%PROFILE%','--date-start','%DATE_START%','--date-end','%DATE_END%','--snapshot-start','%SNAPSHOT_START%','--snapshot-end','%SNAPSHOT_END%','--max-workers','%MAX_WORKERS%','--snapshot-block-size','%SNAPSHOT_BLOCK_SIZE%','--max-tasks-per-child','%MAX_TASKS_PER_CHILD%','--max-in-flight-tasks','%MAX_IN_FLIGHT_TASKS%','--resume-mode','off','--cpu-dtw-backend','%CPU_DTW_BACKEND%','--dtw-pair-batch-size','%DTW_PAIR_BATCH_SIZE%') -RedirectStandardOutput '%RUN_STDOUT%' -RedirectStandardError '%RUN_STDERR%' -PassThru -WindowStyle Hidden; $p.Id"') do set "RUN_PID=%%I"
+set "STATUS_LINE=Launching python worker..."
+for /f %%I in ('powershell -NoProfile -Command "$argsList=@('%RUN_SCRIPT%','--pack-root','%PACK_ROOT%','--output-root','%OUTPUT_ROOT%','--run-name','%RUN_NAME%','--profile','%PROFILE%','--date-start','%DATE_START%','--date-end','%DATE_END%','--max-workers','%MAX_WORKERS%','--snapshot-block-size','%SNAPSHOT_BLOCK_SIZE%','--max-tasks-per-child','%MAX_TASKS_PER_CHILD%','--max-in-flight-tasks','%MAX_IN_FLIGHT_TASKS%','--resume-mode','off','--cpu-dtw-backend','%CPU_DTW_BACKEND%','--dtw-pair-batch-size','%DTW_PAIR_BATCH_SIZE%'); if('%SNAPSHOT_START%' -ne ''){ $argsList += @('--snapshot-start','%SNAPSHOT_START%') }; if('%SNAPSHOT_END%' -ne ''){ $argsList += @('--snapshot-end','%SNAPSHOT_END%') }; $p=Start-Process python -ArgumentList $argsList -RedirectStandardOutput '%RUN_STDOUT%' -RedirectStandardError '%RUN_STDERR%' -PassThru -WindowStyle Hidden; $p.Id"') do set "RUN_PID=%%I"
+if not defined RUN_PID (
+    echo [ERROR] Failed to start python process.
+    if exist "%RUN_STDERR%" powershell -NoProfile -Command "Get-Content '%RUN_STDERR%' -Tail 20"
+    pause
+    exit /b 1
+)
 > "%RUN_PID_FILE%" echo %RUN_PID%
 
 echo [INFO] Python PID: %RUN_PID%
