@@ -1,0 +1,13 @@
+{
+  "name": "stocknetv2",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@duckdb/node-api": "^1.5.3-r.3"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test tests/test_server_routes.mjs"
+  }
+}

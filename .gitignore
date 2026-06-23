@@ -1,0 +1,9 @@
+.pytest_cache/
+__pycache__/
+*.pyc
+node_modules/
+var/
+data/
+research_runs/
+*.log
+*.pid

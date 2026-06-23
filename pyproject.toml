@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stocknetv2"
+version = "0.1.0"
+description = "Backend-first T1 theme discovery quality lab"
+requires-python = ">=3.11"
+dependencies = [
+  "duckdb>=1.4.4",
+  "numpy>=1.26",
+  "pandas>=2.2",
+  "pyarrow>=16",
+  "requests>=2.31",
+  "python-igraph>=0.11",
+  "leidenalg>=0.10",
+  "yfinance>=0.2.65",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

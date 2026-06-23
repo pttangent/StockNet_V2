@@ -1,0 +1,27 @@
+{
+  "policy_version": "2026-06-20",
+  "purpose": "Metadata is exported for post-hoc validation and review only. It must not introduce future bias into model training, graph construction, or historical theme labeling.",
+  "safe_model_features": [
+    "sector",
+    "industry",
+    "exchange",
+    "country"
+  ],
+  "time_dependent_features": [
+    "market_cap_bucket_at_t",
+    "price_at_t",
+    "shares_outstanding_at_t"
+  ],
+  "unsafe_interpretation_only": [
+    "supplier",
+    "customer",
+    "theme",
+    "narrative",
+    "moat"
+  ],
+  "notes": [
+    "Current metadata exports are intended for ex-post evaluation only.",
+    "Do not backfill modern narrative labels into historical model features.",
+    "If market cap is required in modeling, reconstruct it at time t from contemporaneous price and historically valid shares outstanding."
+  ]
+}
