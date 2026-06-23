@@ -5,6 +5,7 @@ import sys
 from datetime import UTC, datetime
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
+from types import SimpleNamespace
 
 import pandas as pd
 
@@ -217,3 +218,36 @@ def test_run_month_graph_compute_collects_multiple_month_packs_from_date_range(t
     assert run_month_graph_compute.main() == 0
     assert (output_root / "month=2025-01" / "dates" / "date=2025-01-31" / "snapshots" / "snapshot=0935").exists()
     assert (output_root / "month=2025-02" / "dates" / "date=2025-02-03" / "snapshots" / "snapshot=0940").exists()
+
+
+def test_resolve_safe_parallelism_caps_cpu_only_dtw_workers(monkeypatch):
+    tasks = [SimpleNamespace()] * 10
+    monkeypatch.setattr(run_month_graph_compute, "_estimate_task_input_bytes", lambda task: 188 * 1024 * 1024)
+    monkeypatch.setattr(run_month_graph_compute, "_available_memory_bytes", lambda: 16 * 1024 * 1024 * 1024)
+
+    workers, in_flight, plan = run_month_graph_compute._resolve_safe_parallelism(
+        tasks=tasks,
+        profile_name="cpu_only_dtw",
+        requested_max_workers=18,
+        requested_max_in_flight_tasks=22,
+        system_memory_reserve_gb=10,
+    )
+
+    assert workers == 8
+    assert in_flight == 10
+    assert plan is not None
+    assert plan["reason"] == "cpu_only_dtw_memory_guard"
+
+
+def test_resolve_safe_parallelism_keeps_non_dtw_profile_requested_values():
+    workers, in_flight, plan = run_month_graph_compute._resolve_safe_parallelism(
+        tasks=[SimpleNamespace()] * 3,
+        profile_name="cpu_no_dtw",
+        requested_max_workers=18,
+        requested_max_in_flight_tasks=22,
+        system_memory_reserve_gb=10,
+    )
+
+    assert workers == 18
+    assert in_flight == 22
+    assert plan is None

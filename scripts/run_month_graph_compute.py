@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import traceback
 import time
@@ -13,6 +14,11 @@ from pathlib import Path
 from collections import Counter
 
 import pandas as pd
+
+try:
+    import psutil
+except ImportError:  # pragma: no cover - optional dependency fallback
+    psutil = None
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 SRC_DIR = ROOT_DIR / "src"
@@ -66,6 +72,11 @@ MODE_DEFAULTS = {
         "dtw_torch_device": "cuda",
     },
 }
+
+CPU_ONLY_DTW_PROFILE_NAMES = {"cpu_only_dtw", "cpu_dtw_only"}
+CPU_ONLY_DTW_HARD_MAX_WORKERS = 8
+CPU_ONLY_DTW_IN_FLIGHT_BUFFER = 2
+CPU_ONLY_DTW_MEMORY_SAFETY_MULTIPLIER = 4
 
 
 def parse_args() -> argparse.Namespace:
@@ -155,6 +166,33 @@ def main() -> int:
         print(json.dumps({"status": "complete", "planned_snapshots": len(schedule), "executed_snapshots": 0}, ensure_ascii=False))
         return 0
 
+    tasks = SnapshotTaskPlanner().plan_blocks(
+        snapshots=pending_schedule,
+        profile=profile,
+        snapshot_block_size=max(1, args.snapshot_block_size),
+    )
+    effective_max_workers, effective_max_in_flight_tasks, concurrency_plan = _resolve_safe_parallelism(
+        tasks=tasks,
+        profile_name=profile.name,
+        requested_max_workers=max(1, args.max_workers),
+        requested_max_in_flight_tasks=max(1, args.max_in_flight_tasks),
+        system_memory_reserve_gb=max(0, args.system_memory_reserve_gb),
+    )
+    if effective_max_workers != args.max_workers or effective_max_in_flight_tasks != args.max_in_flight_tasks:
+        print(
+            json.dumps(
+                {
+                    "status": "parallelism_adjusted",
+                    "profile": profile.name,
+                    "requested_max_workers": args.max_workers,
+                    "effective_max_workers": effective_max_workers,
+                    "requested_max_in_flight_tasks": args.max_in_flight_tasks,
+                    "effective_max_in_flight_tasks": effective_max_in_flight_tasks,
+                    "reason": concurrency_plan.get("reason") if concurrency_plan else "safety_guard",
+                },
+                ensure_ascii=False,
+            )
+        )
     _write_run_config(
         output_root=output_root,
         payload={
@@ -165,17 +203,15 @@ def main() -> int:
             "date_start": args.date_start,
             "date_end": args.date_end,
             "snapshot_block_size": args.snapshot_block_size,
-            "max_workers": args.max_workers,
+            "requested_max_workers": args.max_workers,
+            "effective_max_workers": effective_max_workers,
+            "requested_max_in_flight_tasks": args.max_in_flight_tasks,
+            "effective_max_in_flight_tasks": effective_max_in_flight_tasks,
             "planned_snapshots": len(schedule),
             "pending_snapshots": len(pending_schedule),
             "trade_dates": _build_trade_date_plan(schedule),
+            "concurrency_plan": concurrency_plan,
         },
-    )
-
-    tasks = SnapshotTaskPlanner().plan_blocks(
-        snapshots=pending_schedule,
-        profile=profile,
-        snapshot_block_size=max(1, args.snapshot_block_size),
     )
     failure_count = _run_tasks(
         tasks=tasks,
@@ -189,9 +225,9 @@ def main() -> int:
         dtw_pair_batch_size=args.dtw_pair_batch_size,
         torch_activation_pair_threshold=args.torch_activation_pair_threshold,
         torch_gpu_chunk_size=args.torch_gpu_chunk_size,
-        max_workers=max(1, args.max_workers),
+        max_workers=effective_max_workers,
         max_tasks_per_child=max(1, args.max_tasks_per_child),
-        max_in_flight_tasks=max(1, args.max_in_flight_tasks),
+        max_in_flight_tasks=effective_max_in_flight_tasks,
         continue_on_error=args.continue_on_error,
         run_log_path=run_log_path,
         progress_path=progress_path,
@@ -476,6 +512,115 @@ def _append_failure(failures_path: Path, block_id: str, exc: Exception) -> None:
 
 def _write_run_config(*, output_root: Path, payload: dict[str, object]) -> None:
     (output_root / "run_config.json").write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def _resolve_safe_parallelism(
+    *,
+    tasks,
+    profile_name: str,
+    requested_max_workers: int,
+    requested_max_in_flight_tasks: int,
+    system_memory_reserve_gb: int,
+) -> tuple[int, int, dict[str, object] | None]:
+    effective_max_workers = max(1, requested_max_workers)
+    effective_max_in_flight_tasks = max(1, requested_max_in_flight_tasks)
+    if profile_name not in CPU_ONLY_DTW_PROFILE_NAMES or not tasks or requested_max_workers <= 1:
+        return effective_max_workers, effective_max_in_flight_tasks, None
+
+    hard_max_workers = _read_int_env("STOCKNETV2_CPU_ONLY_DTW_HARD_MAX_WORKERS", CPU_ONLY_DTW_HARD_MAX_WORKERS, minimum=1)
+    in_flight_buffer = _read_int_env("STOCKNETV2_CPU_ONLY_DTW_IN_FLIGHT_BUFFER", CPU_ONLY_DTW_IN_FLIGHT_BUFFER, minimum=0)
+    memory_safety_multiplier = _read_int_env(
+        "STOCKNETV2_CPU_ONLY_DTW_MEMORY_SAFETY_MULTIPLIER",
+        CPU_ONLY_DTW_MEMORY_SAFETY_MULTIPLIER,
+        minimum=1,
+    )
+    estimated_task_bytes = _estimate_task_input_bytes(tasks[0])
+    available_memory_bytes = _available_memory_bytes()
+    memory_limited_workers = effective_max_workers
+    if estimated_task_bytes and available_memory_bytes is not None:
+        reserved_bytes = system_memory_reserve_gb * 1024 * 1024 * 1024
+        usable_bytes = max(0, available_memory_bytes - reserved_bytes)
+        bytes_per_worker = max(1, estimated_task_bytes * memory_safety_multiplier)
+        memory_limited_workers = max(1, usable_bytes // bytes_per_worker) if usable_bytes > 0 else 1
+
+    effective_max_workers = max(
+        1,
+        min(
+            effective_max_workers,
+            len(tasks),
+            hard_max_workers,
+            memory_limited_workers,
+        ),
+    )
+    effective_max_in_flight_tasks = max(
+        1,
+        min(
+            effective_max_in_flight_tasks,
+            len(tasks),
+            effective_max_workers + in_flight_buffer,
+        ),
+    )
+    return (
+        effective_max_workers,
+        effective_max_in_flight_tasks,
+        {
+            "reason": "cpu_only_dtw_memory_guard",
+            "estimated_task_input_bytes": estimated_task_bytes,
+            "available_memory_bytes": available_memory_bytes,
+            "system_memory_reserve_gb": system_memory_reserve_gb,
+            "hard_max_workers": hard_max_workers,
+            "in_flight_buffer": in_flight_buffer,
+            "memory_safety_multiplier": memory_safety_multiplier,
+            "requested_max_workers": requested_max_workers,
+            "effective_max_workers": effective_max_workers,
+            "requested_max_in_flight_tasks": requested_max_in_flight_tasks,
+            "effective_max_in_flight_tasks": effective_max_in_flight_tasks,
+        },
+    )
+
+
+def _estimate_task_input_bytes(task) -> int | None:
+    try:
+        repository = MonthPackReadRepository(str(task.snapshots[0].month_pack_root))
+        block_inputs = repository.read_snapshot_block(
+            trade_date=task.trade_date,
+            window_start=task.window_start,
+            window_end=task.window_end,
+            use_graph_features=True,
+            include_trade_flow=True,
+        )
+    except Exception:
+        return None
+    total_bytes = 0
+    for frame_name in ("raw_1m", "bars_5m", "trade_flow_1m", "features_1m"):
+        frame = getattr(block_inputs, frame_name, None)
+        if frame is None:
+            continue
+        total_bytes += int(frame.memory_usage(deep=True).sum())
+    return total_bytes or None
+
+
+def _available_memory_bytes() -> int | None:
+    if psutil is not None:
+        return int(psutil.virtual_memory().available)
+    if hasattr(os, "sysconf"):
+        try:
+            page_size = os.sysconf("SC_PAGE_SIZE")
+            available_pages = os.sysconf("SC_AVPHYS_PAGES")
+            return int(page_size * available_pages)
+        except (OSError, ValueError):
+            return None
+    return None
+
+
+def _read_int_env(name: str, default: int, *, minimum: int) -> int:
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        return max(minimum, int(value))
+    except ValueError:
+        return default
 
 
 def _build_trade_date_plan(schedule: list[SnapshotSpec]) -> list[dict[str, object]]:

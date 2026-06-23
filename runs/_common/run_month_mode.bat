@@ -48,14 +48,28 @@ if not defined MAX_IN_FLIGHT_TASKS (
 if not defined DTW_PAIR_BATCH_SIZE set "DTW_PAIR_BATCH_SIZE=1024"
 if not defined TORCH_ACTIVATION_PAIR_THRESHOLD set "TORCH_ACTIVATION_PAIR_THRESHOLD=1024"
 if not defined TORCH_GPU_CHUNK_SIZE set "TORCH_GPU_CHUNK_SIZE=8192"
+if not defined SYSTEM_MEMORY_RESERVE_GB set "SYSTEM_MEMORY_RESERVE_GB=10"
 if not defined WRAPPER_NAME set "WRAPPER_NAME=%~nx0"
 if not defined ORIGINAL_BAT_PATH set "ORIGINAL_BAT_PATH=%~f0"
+set "SNAPSHOT_START_ARG="
+set "SNAPSHOT_END_ARG="
+set "DTW_BACKEND_ARG="
+set "DTW_TORCH_DEVICE_ARG="
+set "GRAPH_BACKEND_ARG="
+set "GRAPH_TORCH_DEVICE_ARG="
+if defined SNAPSHOT_START set "SNAPSHOT_START_ARG=--snapshot-start %SNAPSHOT_START%"
+if defined SNAPSHOT_END set "SNAPSHOT_END_ARG=--snapshot-end %SNAPSHOT_END%"
+if defined DTW_BACKEND set "DTW_BACKEND_ARG=--dtw-backend %DTW_BACKEND%"
+if defined DTW_TORCH_DEVICE set "DTW_TORCH_DEVICE_ARG=--dtw-torch-device %DTW_TORCH_DEVICE%"
+if defined GRAPH_BACKEND set "GRAPH_BACKEND_ARG=--graph-backend %GRAPH_BACKEND%"
+if defined GRAPH_TORCH_DEVICE set "GRAPH_TORCH_DEVICE_ARG=--graph-torch-device %GRAPH_TORCH_DEVICE%"
 
 set "OUTPUT_ROOT=%ROOT%\research_runs\%RUN_NAME%"
 set "RUN_SCRIPT=%ROOT%\scripts\run_month_graph_compute.py"
 set "RUN_BAT_ARCHIVE=%OUTPUT_ROOT%\%WRAPPER_NAME%"
 set "RUN_STDOUT=%OUTPUT_ROOT%\launcher.stdout.log"
 set "RUN_STDERR=%OUTPUT_ROOT%\launcher.stderr.log"
+set "RUN_LAUNCH_DIAG=%OUTPUT_ROOT%\launcher.diagnostic.log"
 set "RUN_LOG=%OUTPUT_ROOT%\run.log"
 set "RUN_PROGRESS=%OUTPUT_ROOT%\progress.jsonl"
 set "RUN_PID_FILE=%OUTPUT_ROOT%\run.pid"
@@ -70,6 +84,14 @@ if /I "%~1"=="stop" goto STOP_RUN
 where python >nul 2>nul
 if errorlevel 1 (
     echo [ERROR] Python was not found in PATH.
+    pause
+    exit /b 1
+)
+for /f "delims=" %%I in ('where python') do (
+    if not defined PYTHON_EXE set "PYTHON_EXE=%%I"
+)
+if not defined PYTHON_EXE (
+    echo [ERROR] Unable to resolve python executable from PATH.
     pause
     exit /b 1
 )
@@ -115,27 +137,38 @@ echo Date end       : %DATE_END%
 echo Date workers   : %MAX_WORKERS%
 echo Layer workers  : 1
 echo Resume mode    : %RESUME_MODE%
+echo Python exe     : %PYTHON_EXE%
 if defined DTW_BACKEND echo DTW backend    : %DTW_BACKEND%
 if defined DTW_TORCH_DEVICE echo DTW device     : %DTW_TORCH_DEVICE%
 if defined TORCH_ACTIVATION_PAIR_THRESHOLD echo DTW threshold  : %TORCH_ACTIVATION_PAIR_THRESHOLD%
 if defined TORCH_GPU_CHUNK_SIZE echo DTW chunk size : %TORCH_GPU_CHUNK_SIZE%
+if defined SYSTEM_MEMORY_RESERVE_GB echo Mem reserve GB : %SYSTEM_MEMORY_RESERVE_GB%
 echo Output root    : %OUTPUT_ROOT%
 echo ============================================================
 echo.
 
-for /f %%I in ('powershell -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { $_.Name -eq ''node.exe'' -and $_.CommandLine -like ''*server.js*'' } | ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch {} }; 'ok'"') do set "NODE_CLEANUP=%%I"
+for /f "usebackq" %%I in (`powershell -NoProfile -Command "$procs = Get-CimInstance Win32_Process; foreach($p in $procs){ if($p.Name -eq 'node.exe' -and $p.CommandLine -like '*server.js*'){ try { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue } catch {} } }; 'ok'"`) do set "NODE_CLEANUP=%%I"
 for /f %%P in ('powershell -NoProfile -Command "$ports=3030..3055; foreach($port in $ports){ try { $listener=[System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback,$port); $listener.Start(); $listener.Stop(); $port; break } catch { if($listener){ try { $listener.Stop() } catch {} } } }"') do set "MONITOR_PORT=%%P"
 > "%MONITOR_PORT_FILE%" echo %MONITOR_PORT%
 for /f %%I in ('powershell -NoProfile -Command "$env:PORT='%MONITOR_PORT%'; $env:STOCKNETV2_MONTH_RUN_ROOT='%OUTPUT_ROOT%'; $p=Start-Process node -ArgumentList @('%ROOT%\server.js') -RedirectStandardOutput '%MONITOR_STDOUT%' -RedirectStandardError '%MONITOR_STDERR%' -PassThru -WindowStyle Hidden; $p.Id"') do set "MONITOR_PID=%%I"
 if defined MONITOR_PID (
     > "%MONITOR_PID_FILE%" echo %MONITOR_PID%
-    start "" "http://127.0.0.1:%MONITOR_PORT%/month-progress"
+    rem start "" "http://127.0.0.1:%MONITOR_PORT%/month-progress"
 )
 
 set "STATUS_LINE=Launching python worker..."
-for /f %%I in ('powershell -NoProfile -Command "$argsList=@('%RUN_SCRIPT%','--pack-root','%PACK_ROOT%','--output-root','%OUTPUT_ROOT%','--run-name','%RUN_NAME%','--profile','%PROFILE%','--date-start','%DATE_START%','--date-end','%DATE_END%','--max-workers','%MAX_WORKERS%','--snapshot-block-size','%SNAPSHOT_BLOCK_SIZE%','--max-tasks-per-child','%MAX_TASKS_PER_CHILD%','--max-in-flight-tasks','%MAX_IN_FLIGHT_TASKS%','--resume-mode','%RESUME_MODE%','--dtw-pair-batch-size','%DTW_PAIR_BATCH_SIZE%','--torch-activation-pair-threshold','%TORCH_ACTIVATION_PAIR_THRESHOLD%','--torch-gpu-chunk-size','%TORCH_GPU_CHUNK_SIZE%'); if('%SNAPSHOT_START%' -ne ''){ $argsList += @('--snapshot-start','%SNAPSHOT_START%') }; if('%SNAPSHOT_END%' -ne ''){ $argsList += @('--snapshot-end','%SNAPSHOT_END%') }; if('%DTW_BACKEND%' -ne ''){ $argsList += @('--dtw-backend','%DTW_BACKEND%') }; if('%DTW_TORCH_DEVICE%' -ne ''){ $argsList += @('--dtw-torch-device','%DTW_TORCH_DEVICE%') }; if('%GRAPH_BACKEND%' -ne ''){ $argsList += @('--graph-backend','%GRAPH_BACKEND%') }; if('%GRAPH_TORCH_DEVICE%' -ne ''){ $argsList += @('--graph-torch-device','%GRAPH_TORCH_DEVICE%') }; $p=Start-Process python -ArgumentList $argsList -RedirectStandardOutput '%RUN_STDOUT%' -RedirectStandardError '%RUN_STDERR%' -PassThru -WindowStyle Hidden; $p.Id"') do set "RUN_PID=%%I"
+> "%RUN_LAUNCH_DIAG%" (
+    echo [%date% %time%] python_exe=%PYTHON_EXE%
+    echo [%date% %time%] run_script=%RUN_SCRIPT%
+    echo [%date% %time%] output_root=%OUTPUT_ROOT%
+)
+>> "%RUN_LAUNCH_DIAG%" echo [%date% %time%] launching_with_cmd_start=1
+start "" /b "%PYTHON_EXE%" "%RUN_SCRIPT%" --pack-root "%PACK_ROOT%" --output-root "%OUTPUT_ROOT%" --run-name "%RUN_NAME%" --profile "%PROFILE%" --date-start "%DATE_START%" --date-end "%DATE_END%" --max-workers "%MAX_WORKERS%" --snapshot-block-size "%SNAPSHOT_BLOCK_SIZE%" --max-tasks-per-child "%MAX_TASKS_PER_CHILD%" --max-in-flight-tasks "%MAX_IN_FLIGHT_TASKS%" --resume-mode "%RESUME_MODE%" --dtw-pair-batch-size "%DTW_PAIR_BATCH_SIZE%" --torch-activation-pair-threshold "%TORCH_ACTIVATION_PAIR_THRESHOLD%" --torch-gpu-chunk-size "%TORCH_GPU_CHUNK_SIZE%" --system-memory-reserve-gb "%SYSTEM_MEMORY_RESERVE_GB%" %SNAPSHOT_START_ARG% %SNAPSHOT_END_ARG% %DTW_BACKEND_ARG% %DTW_TORCH_DEVICE_ARG% %GRAPH_BACKEND_ARG% %GRAPH_TORCH_DEVICE_ARG% 1>> "%RUN_STDOUT%" 2>> "%RUN_STDERR%"
+timeout /t 2 /nobreak >nul
+for /f "usebackq delims=" %%I in (`powershell -NoProfile -Command "$runName='%RUN_NAME%'; Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'python.exe' -and $_.CommandLine -like ('*' + $runName + '*') -and $_.CommandLine -like '*run_month_graph_compute.py*' } | Select-Object -First 1 -ExpandProperty ProcessId"`) do set "RUN_PID=%%I"
 if not defined RUN_PID (
     echo [ERROR] Failed to start python process.
+    if exist "%RUN_LAUNCH_DIAG%" type "%RUN_LAUNCH_DIAG%"
     if exist "%RUN_STDERR%" powershell -NoProfile -Command "Get-Content '%RUN_STDERR%' -Tail 20"
     pause
     exit /b 1
